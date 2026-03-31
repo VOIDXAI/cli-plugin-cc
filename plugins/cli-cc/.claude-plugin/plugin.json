@@ -1,0 +1,8 @@
+{
+  "name": "cc",
+  "version": "0.1.0",
+  "description": "Claude Code plugin that delegates workflows to Codex, Gemini, or Droid CLIs.",
+  "author": {
+    "name": "VOIDXAI"
+  }
+}

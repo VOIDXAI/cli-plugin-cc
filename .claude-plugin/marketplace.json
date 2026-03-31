@@ -1,0 +1,9 @@
+{
+  "marketplaces": [
+    {
+      "id": "voidxai-cli-cc",
+      "name": "VOIDXAI CLI CC",
+      "source": "./plugins/cli-cc"
+    }
+  ]
+}
