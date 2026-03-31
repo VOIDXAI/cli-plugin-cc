@@ -21,8 +21,11 @@ The control plane now mirrors the upstream `codex-plugin-cc` model much more clo
 
 ## Quick Start
 
-```bash
-claude --plugin-dir ./plugins/cli-cc
+In Claude Code, add this repository as a marketplace source:
+
+```text
+/plugin marketplace add https://github.com/VOIDXAI/cli-plugin-cc
+/plugin install cc@voidxai-cli-cc
 ```
 
 Then run:
@@ -99,10 +102,11 @@ Best-effort auth detection also checks:
 
 ## Install Into Claude Code
 
-Development-time local loading:
+Recommended marketplace-source install:
 
-```bash
-claude --plugin-dir ./plugins/cli-cc
+```text
+/plugin marketplace add https://github.com/VOIDXAI/cli-plugin-cc
+/plugin install cc@voidxai-cli-cc
 ```
 
 Headless smoke check:
@@ -117,12 +121,18 @@ Static validation:
 claude plugin validate ./plugins/cli-cc
 ```
 
-Repository-local marketplace source:
+Repository-local marketplace source for local development:
 
 1. Keep `.claude-plugin/marketplace.json` at the repo root.
 2. Point Claude Code at the local marketplace source.
 3. Install the `cc` plugin from that local source.
 4. Run `/cc:setup --all`.
+
+Direct development-time loading:
+
+```bash
+claude --plugin-dir ./plugins/cli-cc
+```
 
 Once loaded, the main commands are:
 
