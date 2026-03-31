@@ -1,38 +1,66 @@
 # cli-plugin-cc
 
-`cli-plugin-cc` is a multi-engine Claude Code plugin that gives you one shared `/cc:*` command surface for Codex, Gemini, and Droid.
+Run Codex, Gemini, or Droid from inside Claude Code with one shared workflow for review, rescue, and background jobs.
 
-It is designed as a multi-engine generalization of `codex-plugin-cc`: Claude Code stays the host, while `codex`, `gemini`, and `droid` act as the execution engines behind one control plane.
+`cli-plugin-cc` gives Claude Code one shared `/cc:*` command surface while letting `codex`, `gemini`, and `droid` act as the execution engines behind the scenes.
 
-Use it to:
+This plugin is for Claude Code users who want a multi-engine workflow without leaving the repo they already have open.
 
-- run reviews and adversarial reviews without leaving Claude Code
-- hand off rescue tasks to external coding CLIs with native resume where available
-- keep shared job tracking, status, result lookup, and cancel behavior across engines
+## What You Get
 
-The control plane now mirrors the upstream `codex-plugin-cc` model much more closely:
-
-- shared Codex app-server broker runtime per Claude session
-- tracked job files plus repository-scoped state
-- rich `/cc:status`, `/cc:result`, and `/cc:cancel`
-- stop-time review gate with upstream-style block decision payloads
-- session lifecycle cleanup for jobs and broker state
+- `/cc:review` and `/cc:adversarial-review` for normal and challenge-style reviews
+- `/cc:rescue`, `/cc:status`, `/cc:result`, and `/cc:cancel` to delegate work and manage background jobs
+- `/cc:setup` to verify engine readiness, set repo-local defaults, and manage the optional stop-time review gate
+- one shared control plane for job tracking, result lookup, cancel, resume hints, and session cleanup
 - modular engine adapters under `plugins/cli-cc/scripts/lib/engines/`
 
-## Quick Start
+## Requirements
 
-In Claude Code, add this repository as a marketplace source:
+- Claude Code with plugin support
+- Node.js 20 or later
+- At least one supported CLI installed: `codex`, `gemini`, or `droid`
+- Auth already configured for whichever engine you plan to use
+
+## Install
+
+The commands below assume this repository is published as `VOIDXAI/cli-plugin-cc`. If you fork it or rename it, adjust the marketplace path accordingly.
+
+Add the marketplace in Claude Code:
 
 ```text
-/plugin marketplace add https://github.com/VOIDXAI/cli-plugin-cc
+/plugin marketplace add VOIDXAI/cli-plugin-cc
+```
+
+Install the plugin:
+
+```text
 /plugin install cc@voidxai-cli-cc
+```
+
+Reload plugins:
+
+```text
+/reload-plugins
 ```
 
 Then run:
 
-- `/cc:setup --all`
-- `/cc:review --engine codex`
-- `/cc:rescue --engine gemini`
+```text
+/cc:setup --all
+```
+
+After install, you should see:
+
+- the `/cc:*` slash commands listed below
+- the `cc:cc-rescue` subagent in `/agents`
+
+One simple first run is:
+
+```text
+/cc:review --engine codex --background
+/cc:status
+/cc:result
+```
 
 ## Commands
 
