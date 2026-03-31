@@ -164,10 +164,6 @@ Validated locally on March 31, 2026 with:
 - Stop-gate block/allow hook paths covered in automated tests
 - Automated coverage for explicit `--model` passthrough, `--effort`, Codex/Gemini/Droid resume, and stored status/result hints
 
-Notes:
-
-- On this Ubuntu 24.04 VM, Codex Linux sandbox startup required host-level fixes: installing `uidmap` and setting `kernel.apparmor_restrict_unprivileged_userns = 0`.
-
 ## Development
 
 Engine extension notes live in [docs/EXTENDING.md](docs/EXTENDING.md).
