@@ -1,8 +1,20 @@
 {
-  "marketplaces": [
+  "name": "voidxai-cli-cc",
+  "owner": {
+    "name": "VOIDXAI"
+  },
+  "metadata": {
+    "description": "Claude Code plugins to use Codex, Gemini, or Droid through one shared workflow.",
+    "version": "0.1.0"
+  },
+  "plugins": [
     {
-      "id": "voidxai-cli-cc",
-      "name": "VOIDXAI CLI CC",
+      "name": "cc",
+      "description": "Run Codex, Gemini, or Droid from Claude Code with one shared workflow for review, rescue, and background jobs.",
+      "version": "0.1.0",
+      "author": {
+        "name": "VOIDXAI"
+      },
       "source": "./plugins/cli-cc"
     }
   ]

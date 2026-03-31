@@ -27,25 +27,25 @@ The commands below assume this repository is published as `VOIDXAI/cli-plugin-cc
 
 Add the marketplace in Claude Code:
 
-```text
+```bash
 /plugin marketplace add VOIDXAI/cli-plugin-cc
 ```
 
 Install the plugin:
 
-```text
+```bash
 /plugin install cc@voidxai-cli-cc
 ```
 
 Reload plugins:
 
-```text
+```bash
 /reload-plugins
 ```
 
 Then run:
 
-```text
+```bash
 /cc:setup --all
 ```
 
@@ -56,7 +56,7 @@ After install, you should see:
 
 One simple first run is:
 
-```text
+```bash
 /cc:review --engine codex --background
 /cc:status
 /cc:result
@@ -128,14 +128,7 @@ Best-effort auth detection also checks:
 - `GOOGLE_API_KEY`
 - `FACTORY_API_KEY`
 
-## Install Into Claude Code
-
-Recommended marketplace-source install:
-
-```text
-/plugin marketplace add https://github.com/VOIDXAI/cli-plugin-cc
-/plugin install cc@voidxai-cli-cc
-```
+## Local Development
 
 Headless smoke check:
 
@@ -149,7 +142,7 @@ Static validation:
 claude plugin validate ./plugins/cli-cc
 ```
 
-Repository-local marketplace source for local development:
+Repository-local marketplace source:
 
 1. Keep `.claude-plugin/marketplace.json` at the repo root.
 2. Point Claude Code at the local marketplace source.
