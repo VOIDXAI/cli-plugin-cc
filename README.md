@@ -1,8 +1,14 @@
 # cli-plugin-cc
 
-`cli-plugin-cc` is a Claude Code plugin that routes a shared `/cc:*` command surface to different external coding CLIs.
+`cli-plugin-cc` is a multi-engine Claude Code plugin that gives you one shared `/cc:*` command surface for Codex, Gemini, and Droid.
 
-It is designed as a multi-engine generalization of `codex-plugin-cc`: Claude Code stays the host, while `codex`, `gemini`, and `droid` act as the execution engines behind a unified command surface.
+It is designed as a multi-engine generalization of `codex-plugin-cc`: Claude Code stays the host, while `codex`, `gemini`, and `droid` act as the execution engines behind one control plane.
+
+Use it to:
+
+- run reviews and adversarial reviews without leaving Claude Code
+- hand off rescue tasks to external coding CLIs with native resume where available
+- keep shared job tracking, status, result lookup, and cancel behavior across engines
 
 The control plane now mirrors the upstream `codex-plugin-cc` model much more closely:
 
@@ -12,6 +18,18 @@ The control plane now mirrors the upstream `codex-plugin-cc` model much more clo
 - stop-time review gate with upstream-style block decision payloads
 - session lifecycle cleanup for jobs and broker state
 - modular engine adapters under `plugins/cli-cc/scripts/lib/engines/`
+
+## Quick Start
+
+```bash
+claude --plugin-dir ./plugins/cli-cc
+```
+
+Then run:
+
+- `/cc:setup --all`
+- `/cc:review --engine codex`
+- `/cc:rescue --engine gemini`
 
 ## Commands
 
