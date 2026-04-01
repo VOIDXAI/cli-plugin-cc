@@ -9,8 +9,8 @@ This plugin is for Claude Code users who want one command surface for multi-engi
 - `/cc:review` for a normal read-only review
 - `/cc:adversarial-review` for a steerable challenge review
 - `/cc:rescue`, `/cc:status`, `/cc:result`, and `/cc:cancel` to delegate work and manage background jobs
-- `/cc:setup` to check engine readiness, store repo-local defaults, and manage the optional stop-time review gate
-- one shared control plane for job tracking, result lookup, cancel, resume hints, and session cleanup
+- `/cc:setup` to check engine readiness, save defaults for this repo, and manage the optional review gate
+- one place to track jobs, view results, cancel runs, and continue earlier work
 
 ## Requirements
 
@@ -119,7 +119,7 @@ This command is read-only. It does not fix code.
 
 ### `/cc:rescue`
 
-Hands a task to the selected engine through the shared `/cc` task runtime.
+Hands a task to the selected engine.
 
 Use it when you want the engine to:
 
@@ -129,7 +129,7 @@ Use it when you want the engine to:
 - take a faster or cheaper pass with a smaller model
 
 It supports `--background`, `--wait`, `--resume`, and `--fresh`.
-If you omit `--resume` and `--fresh`, the plugin can offer to continue the latest rescue thread for the same repo, engine, and Claude session.
+If you omit `--resume` and `--fresh`, the plugin can offer to continue the latest rescue run in the same repo for the same engine.
 
 Examples:
 
@@ -149,8 +149,8 @@ Ask cc rescue with Codex to redesign the database connection to be more resilien
 
 Notes:
 
-- if you do not pass `--model` or `--effort`, the engine uses its normal defaults unless you stored repo-local defaults with `/cc:setup`
-  Gemini is the exception for `--effort`: the current Gemini CLI does not expose a reasoning-effort flag, so the plugin warns on explicit Gemini `--effort`, ignores it, and ignores stale stored Gemini effort defaults
+- if you do not pass `--model` or `--effort`, the engine uses its normal defaults unless you saved defaults with `/cc:setup`
+  Gemini is the exception for `--effort`: the plugin warns, ignores it, and also ignores any older saved Gemini effort value
 - follow-up rescue requests can continue the latest engine task in the repo
 - if you do not specify `--wait` or `--background`, `/cc:rescue` defaults to foreground
 
@@ -158,7 +158,7 @@ Notes:
 
 Shows running and recent `/cc` jobs for the current repository.
 
-Without a job id, it renders a compact table of current-session jobs.
+Without a job id, it renders a compact table of recent jobs in the current repository.
 With a job id, it shows the full stored detail for that specific run.
 
 Examples:
@@ -178,7 +178,7 @@ Use it to:
 ### `/cc:result`
 
 Shows the final stored output for a finished job.
-When available, it also includes the underlying session id and an engine-appropriate resume hint.
+When available, it also includes a resume hint.
 
 Examples:
 
@@ -200,7 +200,7 @@ Examples:
 
 ### `/cc:setup`
 
-Checks which engines are installed and authenticated, and lets you store repo-local defaults for later `/cc:review`, `/cc:adversarial-review`, and `/cc:rescue` runs.
+Checks which engines are installed and authenticated, and lets you save defaults for later `/cc:review`, `/cc:adversarial-review`, and `/cc:rescue` runs in this repo.
 
 Examples:
 
@@ -221,7 +221,7 @@ You can also use `/cc:setup` to manage the optional review gate.
 /cc:setup --disable-review-gate
 ```
 
-When the review gate is enabled, the plugin uses a `Stop` hook to run a targeted stop-time review through the configured engine. If that review finds issues, the stop is blocked so Claude can address them first.
+When the review gate is enabled, Claude can run a targeted review before stopping. If that review finds issues, the stop is blocked so Claude can address them first.
 
 ## Typical Flows
 
@@ -251,173 +251,23 @@ Then check in with:
 /cc:result
 ```
 
-## Engine Integration
-
-The plugin wraps local CLI installations and keeps one shared control plane on the Claude side.
-
-### Supported Engines
-
-- `codex`: uses the Codex app-server for native review, task, resume, interrupt, and broker-backed runtime reuse inside one Claude session
-- `gemini`: uses Gemini headless mode with `--prompt`, `--output-format json`, a pseudo-terminal wrapper for reliable non-interactive execution, and native `--resume`
-- `droid`: uses `droid exec` headless mode with `--output-format stream-json` and native `--session-id`
-
-### Model And Effort Handling
-
-- `--model` is passed through exactly as written for all three engines
-- if you omit `--model`, the plugin does not inject an engine-specific model default; it falls through to the underlying CLI unless you stored a repo-local default with `/cc:setup`
-- `--effort` is forwarded for Codex and Droid; Droid maps the shared plugin levels onto the smaller set that its CLI accepts
-- Gemini currently does not expose a CLI reasoning-effort flag, so `/cc:setup --engine gemini --effort ...` and runtime Gemini `--effort` values warn and continue while ignoring the effort request
-- stale Gemini effort defaults from older plugin state are ignored at runtime and shown as ignored in `/cc:setup`
-- `/cc:setup --engine <engine> --model ... --effort ...` stores repo-local defaults for later runs when those flags are omitted, for engines that support effort control
-- Gemini failures surface the concrete model id plus server error details and exit non-zero so Claude can treat them as real failures
-
-### Control Plane Parity
-
-The current implementation includes the main upstream control-plane pieces adapted for a multi-engine host:
-
-- workspace-root scoped state directories and job pruning
-- per-job JSON snapshots and log files
-- tracked progress updates for phase, thread, and turn ids
-- broker-backed Codex app-server reuse inside one Claude session
-- session start/end hooks that export session ids and tear down broker state
-- status and result lookup from stored job snapshots instead of transient stdout only
-- cancel flow that combines engine interrupt with process-tree termination
-- stop review gate that reads Claude hook JSON, filters jobs by session, and emits `{"decision":"block","reason":...}` when it must block
-
-## Environment Overrides
-
-Use these variables if the binaries are not on your `PATH` or if you want to point at wrappers:
-
-- `CLI_PLUGIN_CC_CODEX_BIN`
-- `CLI_PLUGIN_CC_GEMINI_BIN`
-- `CLI_PLUGIN_CC_DROID_BIN`
-- `CLI_PLUGIN_CC_DATA_DIR`
-- `CLI_PLUGIN_CC_CODEX_SANDBOX`
-- `CLI_PLUGIN_CC_CODEX_REVIEW_SANDBOX`
-- `CLI_PLUGIN_CC_CODEX_TASK_SANDBOX`
-
-Best-effort auth detection also checks:
-
-- `OPENAI_API_KEY`
-- `GEMINI_API_KEY`
-- `GOOGLE_API_KEY`
-- `FACTORY_API_KEY`
-
 ## FAQ
 
 ### Do I need separate accounts for each engine?
 
 Only for the engines you actually want to use. This plugin uses whatever local authentication each CLI already has access to.
 
-- Codex can use your local Codex CLI sign-in and supports `!codex login`
-- Gemini typically uses `GEMINI_API_KEY`, `GOOGLE_API_KEY`, or local Gemini auth files
-- Droid uses its normal local Factory auth state or `FACTORY_API_KEY`
-
-### Does the plugin use separate runtimes?
-
-No. The plugin delegates through the local CLIs already installed on your machine.
-
-That means:
-
-- it uses the same local installs you would use directly
-- it uses the same authentication state those CLIs already have
-- it uses the same repository checkout and machine-local environment
+- Codex can use your local Codex sign-in and supports `!codex login`
+- Gemini uses whatever local sign-in or API key you already use with the Gemini CLI
+- Droid uses whatever local sign-in or API key you already use with Droid
 
 ### Will it reuse my existing Codex setup?
 
-Yes. Codex runs go through your local Codex CLI and app-server setup.
-Gemini and Droid also use their normal local CLI behavior.
+Yes. The plugin uses your existing local Codex, Gemini, and Droid CLI setup.
 
 ### How do resume hints work?
 
-Finished jobs can store the underlying session identifier and show an engine-appropriate resume hint.
+Finished jobs can show a resume hint.
 
 - Codex jobs show `codex resume <thread-id>` when available
 - Gemini and Droid jobs point back to `/cc:rescue --engine <engine> --resume`
-
-## Local Development
-
-Headless smoke check:
-
-```bash
-claude -p --plugin-dir ./plugins/cli-cc '/cc:setup --all'
-```
-
-Static validation:
-
-```bash
-claude plugin validate ./plugins/cli-cc
-```
-
-Repository-local marketplace source:
-
-1. Keep `.claude-plugin/marketplace.json` at the repo root.
-2. Point Claude Code at the local marketplace source.
-3. Install the `cc` plugin from that local source.
-4. Run `/cc:setup --all`.
-
-Direct development-time loading:
-
-```bash
-claude --plugin-dir ./plugins/cli-cc
-```
-
-Once loaded, the main commands are:
-
-- `/cc:setup --all`
-- `/cc:review --engine codex`
-- `/cc:adversarial-review --engine codex`
-- `/cc:rescue --engine gemini`
-- `/cc:status`
-- `/cc:result`
-- `/cc:cancel`
-
-Useful status patterns:
-
-- `/cc:status`
-- `/cc:status <job-id>`
-- `/cc:status <job-id> --wait`
-- `/cc:result <job-id>`
-
-## Validation
-
-Validated locally on March 31, 2026 with:
-
-- `npm test`
-- `claude plugin validate ./plugins/cli-cc`
-- `claude -p --plugin-dir ./plugins/cli-cc '/cc:setup --all'`
-- real `codex` app-server review + task + resume
-- real `gemini` review + task + resume with the plugin falling through to Gemini CLI defaults unless a model is set
-- explicit Gemini `--effort` warning+ignore behavior and backward-compatible ignoring of stale stored Gemini effort defaults
-- real `gemini` background task with `status --wait` + `result`
-- real `gemini` preview-model failure path with surfaced `model/code/reason`
-- real `droid` headless review
-- stop-gate block/allow hook paths covered in automated tests
-- automated coverage for explicit `--model` passthrough, `--effort`, Codex/Gemini/Droid resume, and stored status/result hints
-
-## Development
-
-Engine extension notes live in [docs/EXTENDING.md](docs/EXTENDING.md).
-
-Run tests with:
-
-```bash
-npm test
-```
-
-Run live smoke tests against the locally installed/authenticated engines with:
-
-```bash
-npm run test:live
-```
-
-Useful live-test options:
-
-- `CLI_PLUGIN_CC_LIVE_ENGINES=codex,gemini npm run test:live`
-- `CLI_PLUGIN_CC_LIVE_FULL=1 npm run test:live`
-- `CLI_PLUGIN_CC_LIVE_CANCEL=1 npm run test:live`
-- `CLI_PLUGIN_CC_LIVE_CODEX_MODEL=gpt-5.4 npm run test:live`
-- `CLI_PLUGIN_CC_LIVE_DROID_MODEL=gpt-5.4 npm run test:live`
-- `CLI_PLUGIN_CC_LIVE_TIMEOUT_MS=900000 npm run test:live`
-
-`npm test` stays deterministic and uses fake engines only. `npm run test:live` uses the real local CLIs, skips engines that are unavailable or not signed in, and by default exercises setup, review, foreground task, resume, and background `status/result`. Gemini live smoke is pinned to `gemini-2.5-flash-lite`, and Gemini live invocations are wrapped with `timeout -k 15s 600s` semantics so a stuck run gets reaped instead of wedging the VM. Add `CLI_PLUGIN_CC_LIVE_FULL=1` to include adversarial review, and `CLI_PLUGIN_CC_LIVE_CANCEL=1` to include live cancel smoke. Transient provider-capacity failures are skipped with a diagnostic so a flaky default model does not make the whole smoke suite unusable.
