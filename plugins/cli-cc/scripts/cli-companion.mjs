@@ -55,6 +55,11 @@ import {
   nowIso,
   runTrackedJob
 } from "./lib/tracked-jobs.mjs";
+import {
+  normalizeTaskPermission,
+  resolveConfiguredTaskPermission,
+  formatTaskPermissionSummary
+} from "./lib/permissions.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
 const SCRIPT_PATH = fileURLToPath(import.meta.url);
@@ -213,6 +218,18 @@ function applyEngineDefaults(engine, options, defaults = {}, onWarning = null) {
   };
 }
 
+function applyTaskDefaults(engine, options, defaults = {}, onWarning = null) {
+  const resolved = applyEngineDefaults(engine, options, defaults, onWarning);
+  const permission = resolveConfiguredTaskPermission(engine, options.permission, defaults.permission);
+  return {
+    ...resolved,
+    requestedPermission: permission.requestedPermission,
+    permission: permission.resolvedPermission,
+    permissionSource: permission.source,
+    permissionNative: permission.nativeLabel
+  };
+}
+
 function resolveBackground(options) {
   return Boolean(options.background) && !options.wait;
 }
@@ -258,6 +275,14 @@ function createReviewJob({ workspaceRoot, cwd, engine, kind, options, focusText 
 }
 
 function createTaskJob({ workspaceRoot, cwd, engine, options, prompt, readOnly = false, jobClass = "task" }) {
+  const semanticPermission = !readOnly && jobClass === "task" ? normalizeTaskPermission(options.permission) : null;
+  const permissionSummary =
+    !readOnly && jobClass === "task"
+      ? formatTaskPermissionSummary({
+          permission: semanticPermission,
+          nativeLabel: options.permissionNative
+        })
+      : null;
   return createBaseJob({
     workspaceRoot,
     cwd,
@@ -266,13 +291,18 @@ function createTaskJob({ workspaceRoot, cwd, engine, options, prompt, readOnly =
     kindLabel: jobClass === "gate" ? "stop-gate" : "rescue",
     title: `${jobClass === "gate" ? "gate" : "rescue"} via ${engine}`,
     extra: {
-      write: !readOnly,
+      write: !readOnly && semanticPermission !== "read-only",
       readOnly,
       prompt,
       resume: Boolean(options.resume),
       resumeSessionRef: null,
       model: normalizeRequestedModel(engine, options.model),
-      effort: normalizeReasoningEffort(options.effort)
+      effort: normalizeReasoningEffort(options.effort),
+      requestedPermission: !readOnly && jobClass === "task" ? normalizeTaskPermission(options.requestedPermission) : null,
+      permission: semanticPermission,
+      permissionSource: !readOnly && jobClass === "task" ? options.permissionSource ?? "legacy" : null,
+      permissionNative: !readOnly && jobClass === "task" ? options.permissionNative ?? null : null,
+      permissionSummary
     }
   });
 }
@@ -340,7 +370,8 @@ async function executeJob(job) {
               resumeSessionRef: job.resumeSessionRef ?? null,
               model: job.model,
               effort: job.effort,
-              readOnly: Boolean(job.readOnly)
+              readOnly: Boolean(job.readOnly),
+              permission: job.permission
             }
       );
 
@@ -460,15 +491,15 @@ async function waitForSingleJobSnapshot(cwd, reference, options = {}) {
 
 async function handleSetup(argv) {
   const { options } = parseCommandInput(argv, {
-    valueOptions: ["cwd", "engine", "model", "effort"],
+    valueOptions: ["cwd", "engine", "model", "effort", "permission"],
     booleanOptions: ["json", "all", "enable-review-gate", "disable-review-gate"]
   });
 
   if (options["enable-review-gate"] && options["disable-review-gate"]) {
     throw new Error("Choose either --enable-review-gate or --disable-review-gate.");
   }
-  if (options.all && (options.model != null || options.effort != null)) {
-    throw new Error("Use --engine when setting default --model or --effort.");
+  if (options.all && (options.model != null || options.effort != null || options.permission != null)) {
+    throw new Error("Use --engine when setting default --model, --effort, or --permission.");
   }
 
   const cwd = resolveCommandCwd(options);
@@ -488,8 +519,9 @@ async function handleSetup(argv) {
     setConfig(workspaceRoot, { stopReviewGate: false });
   }
 
-  if (options.model != null || options.effort != null) {
+  if (options.model != null || options.effort != null || options.permission != null) {
     const normalizedEffort = resolveConfiguredEffort(setupEngine, options.effort, null, emitWarning);
+    const normalizedPermission = normalizeTaskPermission(options.permission);
     const currentDefaults = getEngineDefaults(getConfig(workspaceRoot), setupEngine);
     setConfig(workspaceRoot, {
       engineDefaults: {
@@ -497,7 +529,8 @@ async function handleSetup(argv) {
         [setupEngine]: {
           ...currentDefaults,
           ...(options.model != null ? { model: normalizeRequestedModel(setupEngine, options.model) } : {}),
-          ...(options.effort != null ? { effort: normalizedEffort } : {})
+          ...(options.effort != null ? { effort: normalizedEffort } : {}),
+          ...(options.permission != null ? { permission: normalizedPermission } : {})
         }
       }
     });
@@ -546,7 +579,7 @@ async function handleReview(argv, kind) {
 
 async function handleTask(argv, { jobClass = "task", readOnly = false } = {}) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["cwd", "engine", "model", "effort"],
+    valueOptions: ["cwd", "engine", "model", "effort", "permission"],
     booleanOptions: ["json", "background", "wait", "resume", "fresh"]
   });
 
@@ -557,7 +590,9 @@ async function handleTask(argv, { jobClass = "task", readOnly = false } = {}) {
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const engine = resolveEngine(options, workspaceRoot);
-  const resolvedOptions = applyEngineDefaults(engine, options, getEngineDefaults(getConfig(workspaceRoot), engine), emitWarning);
+  const resolvedOptions = readOnly
+    ? applyEngineDefaults(engine, options, getEngineDefaults(getConfig(workspaceRoot), engine), emitWarning)
+    : applyTaskDefaults(engine, options, getEngineDefaults(getConfig(workspaceRoot), engine), emitWarning);
   let job = createTaskJob({
     workspaceRoot,
     cwd,

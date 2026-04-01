@@ -11,6 +11,7 @@ import {
   runProcessWithScriptPty
 } from "./shared.mjs";
 import { buildCompletedEvent, createEngineRunController, getEngineCapabilities } from "./runtime.mjs";
+import { appendTaskPermissionFailureGuidance, buildTaskPermissionProfile } from "../permissions.mjs";
 
 const info = ENGINE_INFO.gemini;
 const runtimeCapabilities = getEngineCapabilities(info.id);
@@ -156,22 +157,8 @@ function buildTaskPrompt({ prompt, cwd }) {
   ].join("\n");
 }
 
-async function runTaskInternal({ cwd, prompt, model, readOnly = false, onEvent }) {
-  const { payload, model: resolvedModel, failure, ok } = await runGeminiCommand({
-    cwd,
-    model,
-    onEvent,
-    args: ["-p", buildTaskPrompt({ prompt, cwd }), "--output-format", "json", "--approval-mode", readOnly ? "plan" : "auto_edit"]
-  });
-  return {
-    ok,
-    finalText: ok ? payload.finalText : formatGeminiFailure(failure, payload.finalText),
-    sessionRef: payload.sessionRef,
-    model: resolvedModel
-  };
-}
-
-async function runResumeInternal({ cwd, prompt, resumeSessionRef, model, readOnly = false, onEvent }) {
+async function runTaskInternal({ cwd, prompt, model, readOnly = false, permission = null, onEvent }) {
+  const permissionProfile = buildTaskPermissionProfile(info.id, permission);
   const { payload, model: resolvedModel, failure, ok } = await runGeminiCommand({
     cwd,
     model,
@@ -182,14 +169,43 @@ async function runResumeInternal({ cwd, prompt, resumeSessionRef, model, readOnl
       "--output-format",
       "json",
       "--approval-mode",
-      readOnly ? "plan" : "auto_edit",
+      readOnly ? "plan" : permissionProfile.approvalMode ?? "auto_edit"
+    ]
+  });
+  return {
+    ok,
+    finalText:
+      ok
+        ? payload.finalText
+        : appendTaskPermissionFailureGuidance(info.id, permission, formatGeminiFailure(failure, payload.finalText)),
+    sessionRef: payload.sessionRef,
+    model: resolvedModel
+  };
+}
+
+async function runResumeInternal({ cwd, prompt, resumeSessionRef, model, readOnly = false, permission = null, onEvent }) {
+  const permissionProfile = buildTaskPermissionProfile(info.id, permission);
+  const { payload, model: resolvedModel, failure, ok } = await runGeminiCommand({
+    cwd,
+    model,
+    onEvent,
+    args: [
+      "-p",
+      buildTaskPrompt({ prompt, cwd }),
+      "--output-format",
+      "json",
+      "--approval-mode",
+      readOnly ? "plan" : permissionProfile.approvalMode ?? "auto_edit",
       "--resume",
       resumeSessionRef || "latest"
     ]
   });
   return {
     ok,
-    finalText: ok ? payload.finalText : formatGeminiFailure(failure, payload.finalText),
+    finalText:
+      ok
+        ? payload.finalText
+        : appendTaskPermissionFailureGuidance(info.id, permission, formatGeminiFailure(failure, payload.finalText)),
     sessionRef: payload.sessionRef,
     model: resolvedModel
   };

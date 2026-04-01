@@ -12,6 +12,7 @@ import {
   runProcess
 } from "./shared.mjs";
 import { buildCompletedEvent, createEngineRunController, getEngineCapabilities } from "./runtime.mjs";
+import { appendTaskPermissionFailureGuidance, buildTaskPermissionProfile } from "../permissions.mjs";
 
 const info = ENGINE_INFO.droid;
 const runtimeCapabilities = getEngineCapabilities(info.id);
@@ -83,10 +84,15 @@ function buildTaskPrompt({ prompt, cwd }) {
   ].join("\n");
 }
 
-async function runTaskInternal({ cwd, prompt, model, effort, readOnly = false, onEvent }) {
+async function runTaskInternal({ cwd, prompt, model, effort, readOnly = false, permission = null, onEvent }) {
   const args = ["exec", "--cwd", cwd, "--output-format", "stream-json"];
   if (!readOnly) {
-    args.push("--auto", "low");
+    const permissionProfile = buildTaskPermissionProfile(info.id, permission);
+    if (permissionProfile.skipPermissionsUnsafe) {
+      args.push("--skip-permissions-unsafe");
+    } else if (permissionProfile.autoMode) {
+      args.push("--auto", permissionProfile.autoMode);
+    }
   }
   if (model) {
     args.push("--model", model);
@@ -101,15 +107,27 @@ async function runTaskInternal({ cwd, prompt, model, effort, readOnly = false, o
   const payload = parseDroidStreamJson(result.stdout);
   return {
     ok: result.code === 0,
-    finalText: payload.finalText,
+    finalText:
+      result.code === 0
+        ? payload.finalText
+        : appendTaskPermissionFailureGuidance(
+            info.id,
+            permission,
+            [payload.finalText, result.stderr].filter(Boolean).join("\n").trim() || "Droid run failed."
+          ),
     sessionRef: payload.sessionRef
   };
 }
 
-async function runResumeInternal({ cwd, prompt, resumeSessionRef, model, effort, readOnly = false, onEvent }) {
+async function runResumeInternal({ cwd, prompt, resumeSessionRef, model, effort, readOnly = false, permission = null, onEvent }) {
   const args = ["exec", "--cwd", cwd, "--output-format", "stream-json"];
   if (!readOnly) {
-    args.push("--auto", "low");
+    const permissionProfile = buildTaskPermissionProfile(info.id, permission);
+    if (permissionProfile.skipPermissionsUnsafe) {
+      args.push("--skip-permissions-unsafe");
+    } else if (permissionProfile.autoMode) {
+      args.push("--auto", permissionProfile.autoMode);
+    }
   }
   if (model) {
     args.push("--model", model);
@@ -127,7 +145,14 @@ async function runResumeInternal({ cwd, prompt, resumeSessionRef, model, effort,
   const payload = parseDroidStreamJson(result.stdout);
   return {
     ok: result.code === 0,
-    finalText: payload.finalText,
+    finalText:
+      result.code === 0
+        ? payload.finalText
+        : appendTaskPermissionFailureGuidance(
+            info.id,
+            permission,
+            [payload.finalText, result.stderr].filter(Boolean).join("\n").trim() || "Droid run failed."
+          ),
     sessionRef: payload.sessionRef
   };
 }

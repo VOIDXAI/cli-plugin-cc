@@ -1,3 +1,9 @@
+import {
+  buildTaskPermissionProfile,
+  formatConfiguredTaskPermission,
+  formatTaskPermissionSummary
+} from "./permissions.mjs";
+
 function severityRank(severity) {
   switch (severity) {
     case "critical":
@@ -171,6 +177,10 @@ function pushJobDetails(lines, job, options = {}) {
   if (getEffectiveSessionId(job)) {
     lines.push(`  Session ID: ${getEffectiveSessionId(job)}`);
   }
+  const permissionSummary = formatJobPermission(job);
+  if (permissionSummary) {
+    lines.push(`  Permission: ${permissionSummary}`);
+  }
   const resumeCommand = formatResumeCommand(job);
   if (resumeCommand) {
     lines.push(`  Resume: ${resumeCommand}`);
@@ -225,6 +235,20 @@ function formatConfiguredEffort(engine, defaults = {}) {
   return storedEffort ?? "none";
 }
 
+function formatJobPermission(job) {
+  if (job?.jobClass !== "task") {
+    return null;
+  }
+  if (typeof job.permissionSummary === "string" && job.permissionSummary.trim()) {
+    return job.permissionSummary.trim();
+  }
+  const fallbackProfile = buildTaskPermissionProfile(job.engine, job.permission ?? null);
+  return formatTaskPermissionSummary({
+    permission: job.permission ?? null,
+    nativeLabel: job.permissionNative ?? fallbackProfile.nativeLabel
+  });
+}
+
 export function renderSetup(report) {
   const lines = [
     "# cli-plugin-cc setup",
@@ -257,7 +281,8 @@ export function renderSetup(report) {
     const defaults = report.config.engineDefaults?.[engine.id] ?? {};
     const model = defaults.model ?? "none";
     const effort = formatConfiguredEffort(engine, defaults);
-    lines.push(`- ${engine.id}: model=${model}, effort=${effort}`);
+    const permission = formatConfiguredTaskPermission(defaults.permission);
+    lines.push(`- ${engine.id}: model=${model}, effort=${effort}, permission=${permission}`);
   }
   if (Array.isArray(report.nextSteps) && report.nextSteps.length > 0) {
     lines.push("", "Next steps:");
@@ -373,6 +398,10 @@ export function renderTaskResult(result, job) {
   const label = job.jobClass === "gate" ? "Gate Result" : "Rescue Result";
   const lines = [`# ${label} (${job.engine})`, ""];
   lines.push(result.finalText ?? "No output received.");
+  const permissionSummary = formatJobPermission(job);
+  if (permissionSummary) {
+    lines.push("", `Permission: ${permissionSummary}`);
+  }
   appendReasoningSection(lines, result.reasoningSummary ?? []);
   appendSession(lines, result);
 
@@ -485,6 +514,10 @@ export function renderStoredJobResult(job, storedJob) {
     "";
   if (rawOutput) {
     const lines = [rawOutput];
+    const permissionSummary = formatJobPermission(job);
+    if (permissionSummary) {
+      lines.push("", `Permission: ${permissionSummary}`);
+    }
     if (threadId || sessionRef) {
       lines.push("", `Session ID: ${threadId ?? sessionRef}`);
     }

@@ -73,7 +73,7 @@ test("setup reports all three engines and default config", () => {
   assert.match(result.stdout, /droid: available, auth=authenticated/);
   assert.match(result.stdout, /Default engine: codex/);
   assert.match(result.stdout, /Configured defaults:/);
-  assert.match(result.stdout, /codex: model=none, effort=none/);
+  assert.match(result.stdout, /codex: model=none, effort=none, permission=legacy/);
 });
 
 test("setup persists codex defaults and later tasks inherit them", () => {
@@ -82,23 +82,26 @@ test("setup persists codex defaults and later tasks inherit them", () => {
   const fixtures = installFakeEngines(binDir);
   const repoDir = makeRepo();
 
-  const setup = run(process.execPath, [SCRIPT, "setup", "--engine", "codex", "--model", "gpt-5.5", "--effort", "medium"], {
+  const setup = run(process.execPath, [SCRIPT, "setup", "--engine", "codex", "--model", "gpt-5.5", "--effort", "medium", "--permission", "dev"], {
     cwd: repoDir,
     env: envFor(binDir, dataDir)
   });
   assert.equal(setup.status, 0, setup.stderr);
-  assert.match(setup.stdout, /codex: model=gpt-5\.5, effort=medium/);
+  assert.match(setup.stdout, /codex: model=gpt-5\.5, effort=medium, permission=dev/);
 
   const task = run(process.execPath, [SCRIPT, "task", "--engine", "codex", "fix", "it"], {
     cwd: repoDir,
     env: envFor(binDir, dataDir)
   });
   assert.equal(task.status, 0, task.stderr);
+  assert.match(task.stdout, /Permission: dev \(effective: sandbox=workspace-write\)/);
 
   const state = readJson(fixtures.codexStatePath);
   const turnStart = lastValue(findEvents(state, "turn/start"));
+  const threadStart = lastValue(findEvents(state, "thread/start"));
   assert.equal(turnStart?.payload?.model, "gpt-5.5");
   assert.equal(turnStart?.payload?.effort, "medium");
+  assert.equal(threadStart?.payload?.sandbox, "workspace-write");
 });
 
 test("all engines pass model ids through exactly as written", () => {
@@ -133,11 +136,12 @@ test("setup persists gemini and droid defaults for later runs", () => {
   const fixtures = installFakeEngines(binDir);
   const repoDir = makeRepo();
 
-  const geminiSetup = run(process.execPath, [SCRIPT, "setup", "--engine", "gemini", "--model", "gemini-2.5-pro"], {
+  const geminiSetup = run(process.execPath, [SCRIPT, "setup", "--engine", "gemini", "--model", "gemini-2.5-pro", "--permission", "full"], {
     cwd: repoDir,
     env: envFor(binDir, dataDir)
   });
   assert.equal(geminiSetup.status, 0, geminiSetup.stderr);
+  assert.match(geminiSetup.stdout, /gemini: model=gemini-2\.5-pro, effort=none, permission=full/);
 
   const geminiTask = run(process.execPath, [SCRIPT, "task", "--engine", "gemini", "fix", "it"], {
     cwd: repoDir,
@@ -146,22 +150,34 @@ test("setup persists gemini and droid defaults for later runs", () => {
   assert.equal(geminiTask.status, 0, geminiTask.stderr);
   const geminiLog = readJsonLines(fixtures.geminiLogPath);
   assert.match(geminiLog[0].args.join(" "), /--model gemini-2\.5-pro/);
+  assert.match(geminiLog[0].args.join(" "), /--approval-mode yolo/);
 
-  const droidSetup = run(process.execPath, [SCRIPT, "setup", "--engine", "droid", "--model", "gpt-5.4", "--effort", "medium"], {
+  const droidSetup = run(process.execPath, [SCRIPT, "setup", "--engine", "droid", "--model", "gpt-5.4", "--effort", "medium", "--permission", "dev"], {
     cwd: repoDir,
     env: envFor(binDir, dataDir)
   });
   assert.equal(droidSetup.status, 0, droidSetup.stderr);
-  assert.match(droidSetup.stdout, /droid: model=gpt-5\.4, effort=medium/);
+  assert.match(droidSetup.stdout, /droid: model=gpt-5\.4, effort=medium, permission=dev/);
 
   const droidReview = run(process.execPath, [SCRIPT, "review", "--engine", "droid"], {
     cwd: repoDir,
     env: envFor(binDir, dataDir)
   });
   assert.equal(droidReview.status, 0, droidReview.stderr);
+  const droidTask = run(process.execPath, [SCRIPT, "task", "--engine", "droid", "fix", "it"], {
+    cwd: repoDir,
+    env: envFor(binDir, dataDir)
+  });
+  assert.equal(droidTask.status, 0, droidTask.stderr);
+  assert.match(droidTask.stdout, /Permission: dev \(effective: auto=medium\)/);
+
   const droidLog = readJsonLines(fixtures.droidLogPath);
   assert.match(droidLog[0].args.join(" "), /--model gpt-5\.4/);
   assert.match(droidLog[0].args.join(" "), /--reasoning-effort medium/);
+  assert.doesNotMatch(droidLog[0].args.join(" "), /--auto|--skip-permissions-unsafe/);
+  assert.match(droidLog[1].args.join(" "), /--auto medium/);
+  assert.match(droidLog[1].args.join(" "), /--model gpt-5\.4/);
+  assert.match(droidLog[1].args.join(" "), /--reasoning-effort medium/);
 });
 
 test("gemini warns and ignores explicit effort values because its CLI exposes no reasoning-effort flag", () => {
@@ -177,7 +193,7 @@ test("gemini warns and ignores explicit effort values because its CLI exposes no
   assert.equal(setup.status, 0, setup.stderr);
   assert.match(setup.stderr, /Gemini does not support `--effort`/);
   assert.match(setup.stderr, /Ignoring it\./);
-  assert.match(setup.stdout, /gemini: model=none, effort=none/);
+  assert.match(setup.stdout, /gemini: model=none, effort=none, permission=legacy/);
 
   const task = run(process.execPath, [SCRIPT, "task", "--engine", "gemini", "--model", "gemini-2.5-pro", "--effort", "high", "fix", "it"], {
     cwd: repoDir,
@@ -222,7 +238,7 @@ test("gemini ignores stale stored effort defaults from older plugin state", () =
     env: envFor(binDir, dataDir)
   });
   assert.equal(setup.status, 0, setup.stderr);
-  assert.match(setup.stdout, /gemini: model=gemini-2\.5-pro, effort=ignored \(high\)/);
+  assert.match(setup.stdout, /gemini: model=gemini-2\.5-pro, effort=ignored \(high\), permission=legacy/);
 
   const task = run(process.execPath, [SCRIPT, "task", "--engine", "gemini", "fix", "it"], {
     cwd: repoDir,
@@ -262,7 +278,7 @@ test("setup rejects engine defaults when used with --all", () => {
   });
 
   assert.equal(result.status, 1);
-  assert.match(result.stderr, /Use --engine when setting default --model or --effort/);
+  assert.match(result.stderr, /Use --engine when setting default --model, --effort, or --permission/);
 });
 
 test("review uses native codex review and forwards explicit models", () => {
@@ -344,6 +360,7 @@ test("gemini rescue forwards model selection and native resume", () => {
   const firstLog = readJsonLines(fixtures.geminiLogPath);
   assert.equal(firstLog.length, 1);
   assert.match(firstLog[0].args.join(" "), /--model gemini-2\.5-pro/);
+  assert.match(firstLog[0].args.join(" "), /--approval-mode auto_edit/);
 
   const resumed = run(process.execPath, [SCRIPT, "task", "--engine", "gemini", "--resume", "--model", "gemini-2.5-pro"], {
     cwd: repoDir,
@@ -356,6 +373,7 @@ test("gemini rescue forwards model selection and native resume", () => {
   assert.equal(secondLog.length, 2);
   assert.match(secondLog[1].args.join(" "), /--resume gemini-session-123/);
   assert.match(secondLog[1].args.join(" "), /--model gemini-2\.5-pro/);
+  assert.match(secondLog[1].args.join(" "), /--approval-mode auto_edit/);
 });
 
 test("gemini surfaces model failures with the model id and reason", () => {
@@ -442,6 +460,7 @@ test("droid rescue forwards model, mapped effort, and native session resume", ()
   assert.equal(firstLog.length, 1);
   assert.match(firstLog[0].args.join(" "), /--model gpt-5\.4/);
   assert.match(firstLog[0].args.join(" "), /--reasoning-effort none/);
+  assert.match(firstLog[0].args.join(" "), /--auto low/);
 
   const resumed = run(process.execPath, [SCRIPT, "task", "--engine", "droid", "--resume", "--model", "gpt-5.4", "--effort", "xhigh"], {
     cwd: repoDir,
@@ -454,6 +473,92 @@ test("droid rescue forwards model, mapped effort, and native session resume", ()
   assert.equal(secondLog.length, 2);
   assert.match(secondLog[1].args.join(" "), /--session-id droid-session-123/);
   assert.match(secondLog[1].args.join(" "), /--reasoning-effort high/);
+  assert.match(secondLog[1].args.join(" "), /--auto low/);
+});
+
+test("explicit task permissions map to engine-native modes", () => {
+  const binDir = makeTempDir();
+  const dataDir = makeTempDir();
+  const fixtures = installFakeEngines(binDir);
+  const repoDir = makeRepo();
+
+  const codexTask = run(process.execPath, [SCRIPT, "task", "--engine", "codex", "--permission", "full", "fix", "it"], {
+    cwd: repoDir,
+    env: envFor(binDir, dataDir)
+  });
+  assert.equal(codexTask.status, 0, codexTask.stderr);
+  assert.match(codexTask.stdout, /Permission: full \(effective: sandbox=danger-full-access\)/);
+
+  const codexState = readJson(fixtures.codexStatePath);
+  const codexThread = lastValue(findEvents(codexState, "thread/start"));
+  assert.equal(codexThread?.payload?.sandbox, "danger-full-access");
+
+  const geminiTask = run(process.execPath, [SCRIPT, "task", "--engine", "gemini", "--permission", "read-only", "inspect", "it"], {
+    cwd: repoDir,
+    env: envFor(binDir, dataDir)
+  });
+  assert.equal(geminiTask.status, 0, geminiTask.stderr);
+  assert.match(geminiTask.stdout, /Permission: read-only \(effective: approval-mode=plan\)/);
+
+  const geminiLog = readJsonLines(fixtures.geminiLogPath);
+  assert.match(geminiLog.at(-1).args.join(" "), /--approval-mode plan/);
+
+  const droidTask = run(process.execPath, [SCRIPT, "task", "--engine", "droid", "--permission", "unsafe", "fix", "it"], {
+    cwd: repoDir,
+    env: envFor(binDir, dataDir)
+  });
+  assert.equal(droidTask.status, 0, droidTask.stderr);
+  assert.match(droidTask.stdout, /Permission: unsafe \(effective: skip-permissions-unsafe\)/);
+
+  const droidLog = readJsonLines(fixtures.droidLogPath);
+  assert.match(droidLog.at(-1).args.join(" "), /--skip-permissions-unsafe/);
+  assert.doesNotMatch(droidLog.at(-1).args.join(" "), /--auto/);
+});
+
+test("permission failures include actionable retry guidance", () => {
+  const binDir = makeTempDir();
+  const dataDir = makeTempDir();
+  installFakeEngines(binDir);
+  const repoDir = makeRepo();
+
+  const codexFailure = run(process.execPath, [SCRIPT, "task", "--engine", "codex", "--permission", "dev", "delete", "the", "header"], {
+    cwd: repoDir,
+    env: {
+      ...envFor(binDir, dataDir),
+      FAKE_CODEX_PERMISSION_ERROR: "1"
+    }
+  });
+  assert.equal(codexFailure.status, 1);
+  assert.match(codexFailure.stdout, /Sandbox blocked write access/i);
+  assert.match(codexFailure.stdout, /Permission issue detected\./);
+  assert.match(codexFailure.stdout, /Retry with `--permission full` to use `sandbox=danger-full-access`\./);
+
+  const geminiFailure = run(process.execPath, [SCRIPT, "task", "--engine", "gemini", "--permission", "edit", "delete", "the", "header"], {
+    cwd: repoDir,
+    env: {
+      ...envFor(binDir, dataDir),
+      FAKE_GEMINI_ERROR_MESSAGE: "Approval required to write files in this directory.",
+      FAKE_GEMINI_ERROR_CODE: "1",
+      FAKE_GEMINI_ERROR_REASON: "APPROVAL_REQUIRED"
+    }
+  });
+  assert.equal(geminiFailure.status, 1);
+  assert.match(geminiFailure.stdout, /Approval required to write files in this directory\./);
+  assert.match(geminiFailure.stdout, /Permission issue detected\./);
+  assert.match(geminiFailure.stdout, /Retry with `--permission full` to use `--approval-mode yolo`\./);
+
+  const droidFailure = run(process.execPath, [SCRIPT, "task", "--engine", "droid", "--permission", "dev", "delete", "the", "header"], {
+    cwd: repoDir,
+    env: {
+      ...envFor(binDir, dataDir),
+      FAKE_DROID_PERMISSION_ERROR: "1"
+    }
+  });
+  assert.equal(droidFailure.status, 1);
+  assert.match(droidFailure.stdout, /insufficient permission to proceed/i);
+  assert.match(droidFailure.stdout, /Permission issue detected\./);
+  assert.match(droidFailure.stdout, /Retry with `--permission full` to use `--auto high`\./);
+  assert.match(droidFailure.stdout, /retry with `--permission unsafe`/i);
 });
 
 test("job records persist normalized engine capabilities and owner state", () => {
@@ -607,7 +712,7 @@ test("background rescue job supports status and result", async () => {
 
   const start = run(
     process.execPath,
-    [SCRIPT, "task", "--engine", "codex", "--model", "gpt-5.4", "--effort", "high", "--background", "fix", "the", "bug"],
+    [SCRIPT, "task", "--engine", "codex", "--model", "gpt-5.4", "--effort", "high", "--permission", "full", "--background", "fix", "the", "bug"],
     {
       cwd: repoDir,
       env: envFor(binDir, dataDir)
@@ -642,6 +747,8 @@ test("background rescue job supports status and result", async () => {
   const parsedStatus = JSON.parse(statusJson.stdout);
   assert.equal(parsedStatus.job.model, "gpt-5.4");
   assert.equal(parsedStatus.job.effort, "high");
+  assert.equal(parsedStatus.job.permission, "full");
+  assert.equal(parsedStatus.job.permissionNative, "sandbox=danger-full-access");
   assert.match(parsedStatus.job.threadId, /^thr_/);
 
   const statusText = run(process.execPath, [SCRIPT, "status", jobId], {
@@ -650,6 +757,7 @@ test("background rescue job supports status and result", async () => {
   });
   assert.equal(statusText.status, 0, statusText.stderr);
   assert.match(statusText.stdout, /Session ID: thr_/);
+  assert.match(statusText.stdout, /Permission: full \(effective: sandbox=danger-full-access\)/);
   assert.match(statusText.stdout, /Resume: codex resume thr_/);
   assert.match(statusText.stdout, /Result: \/cc:result/);
 
@@ -660,6 +768,7 @@ test("background rescue job supports status and result", async () => {
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /# Rescue Result \(codex\)/);
   assert.match(result.stdout, /Handled the requested task/);
+  assert.match(result.stdout, /Permission: full \(effective: sandbox=danger-full-access\)/);
   assert.match(result.stdout, /Session ID: thr_/);
   assert.match(result.stdout, /Resume: codex resume thr_/);
 });

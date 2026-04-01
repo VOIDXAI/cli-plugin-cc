@@ -1,6 +1,6 @@
 ---
 description: Delegate investigation or implementation work to Codex, Gemini, or Droid from Claude Code.
-argument-hint: "[--engine <codex|gemini|droid>] [--background|--wait] [--resume|--fresh] [--model <id>] [--effort <none|minimal|low|medium|high|xhigh>] [what the engine should investigate, solve, or continue]"
+argument-hint: "[--engine <codex|gemini|droid>] [--background|--wait] [--resume|--fresh] [--model <id>] [--effort <none|minimal|low|medium|high|xhigh>] [--permission <read-only|edit|dev|full|unsafe>] [what the engine should investigate, solve, or continue]"
 allowed-tools: Bash, AskUserQuestion
 ---
 
@@ -15,7 +15,7 @@ Execution mode:
 - If the request includes `--wait`, run the task in the foreground.
 - If neither flag is present, default to foreground.
 - `--background` and `--wait` are Claude-side execution controls. Do not treat them as task text.
-- `--model` and `--effort` are runtime-selection flags. Preserve them for the forwarded `task` call, but do not treat them as task text.
+- `--model`, `--effort`, and `--permission` are runtime-selection flags. Preserve them for the forwarded `task` call, but do not treat them as task text.
 - If the request includes `--resume`, do not ask whether to continue.
 - If the request includes `--fresh`, do not ask whether to continue.
 - Otherwise, before starting the engine, check for a resumable task thread from this Claude session by running:
@@ -37,6 +37,7 @@ Operating rules:
 - Return the companion stdout verbatim to the user.
 - Do not paraphrase, summarize, rewrite, or add commentary before or after it.
 - Leave `--effort` unset unless the user explicitly asks for a specific reasoning effort.
+- Leave `--permission` unset unless the user explicitly asks for a task permission tier.
 - Leave the model unset unless the user explicitly asks for one.
 - If the user did not supply a request, ask what the selected engine should investigate or fix.
 

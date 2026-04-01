@@ -40,5 +40,6 @@ test("engine facade helpers stay stable", () => {
   assert.equal(supportsGate("gemini"), true);
   assert.equal(getEngineRuntimeCapabilities("droid").resumeKind, "session");
   assert.equal(getEngineRuntimeCapabilities("gemini").effortControl, "unsupported");
+  assert.equal(getEngineRuntimeCapabilities("codex").permissionControl, "dual-axis");
   assert.equal(createEngineOwnerState("codex", "running").cancelStrategy, "cooperative");
 });

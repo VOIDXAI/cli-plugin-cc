@@ -23,6 +23,7 @@ import {
   runAppServerReview,
   runAppServerTurn
 } from "../codex.mjs";
+import { appendTaskPermissionFailureGuidance, buildTaskPermissionProfile } from "../permissions.mjs";
 
 const info = ENGINE_INFO.codex;
 const runtimeCapabilities = getEngineCapabilities(info.id);
@@ -104,7 +105,7 @@ function normalizeStructuredReview(parsed) {
   return parsed;
 }
 
-async function runTaskInternal({ cwd, prompt, model, effort, readOnly = false, onProgress }) {
+async function runTaskInternal({ cwd, prompt, model, effort, readOnly = false, permission = null, onProgress }) {
   const taskPrompt = [
     `You are taking over a task from Claude Code in ${cwd}.`,
     "Complete the user request and return a concise final result.",
@@ -115,6 +116,7 @@ async function runTaskInternal({ cwd, prompt, model, effort, readOnly = false, o
 
   const normalizedPrompt = prompt?.trim() ? taskPrompt : DEFAULT_CONTINUE_PROMPT;
   const threadName = buildPersistentTaskThreadName(normalizedPrompt);
+  const permissionProfile = buildTaskPermissionProfile(info.id, permission);
   const result = await runAppServerTurn(cwd, {
     prompt: normalizedPrompt,
     defaultPrompt: DEFAULT_CONTINUE_PROMPT,
@@ -122,12 +124,19 @@ async function runTaskInternal({ cwd, prompt, model, effort, readOnly = false, o
     threadName,
     model,
     effort,
-    sandbox: readOnly ? codexReviewSandbox() : codexTaskSandbox(),
+    sandbox: readOnly ? codexReviewSandbox() : permissionProfile.sandbox ?? codexTaskSandbox(),
     onProgress
   });
   return {
     ok: result.status === 0,
-    finalText: result.finalMessage,
+    finalText:
+      result.status === 0
+        ? result.finalMessage
+        : appendTaskPermissionFailureGuidance(
+            info.id,
+            permission,
+            [result.finalMessage, result.stderr].filter(Boolean).join("\n").trim() || "Codex run failed."
+          ),
     sessionRef: result.threadId,
     threadId: result.threadId,
     turnId: result.turnId,
@@ -136,7 +145,7 @@ async function runTaskInternal({ cwd, prompt, model, effort, readOnly = false, o
   };
 }
 
-async function runResumeInternal({ cwd, prompt, resumeSessionRef, model, effort, readOnly = false, onProgress }) {
+async function runResumeInternal({ cwd, prompt, resumeSessionRef, model, effort, readOnly = false, permission = null, onProgress }) {
   const taskPrompt = [
     `You are taking over a task from Claude Code in ${cwd}.`,
     "Complete the user request and return a concise final result.",
@@ -147,6 +156,7 @@ async function runResumeInternal({ cwd, prompt, resumeSessionRef, model, effort,
 
   const normalizedPrompt = prompt?.trim() ? taskPrompt : DEFAULT_CONTINUE_PROMPT;
   const threadName = buildPersistentTaskThreadName(normalizedPrompt);
+  const permissionProfile = buildTaskPermissionProfile(info.id, permission);
   const result = await runAppServerTurn(cwd, {
     prompt: normalizedPrompt,
     defaultPrompt: DEFAULT_CONTINUE_PROMPT,
@@ -155,12 +165,19 @@ async function runResumeInternal({ cwd, prompt, resumeSessionRef, model, effort,
     threadName,
     model,
     effort,
-    sandbox: readOnly ? codexReviewSandbox() : codexTaskSandbox(),
+    sandbox: readOnly ? codexReviewSandbox() : permissionProfile.sandbox ?? codexTaskSandbox(),
     onProgress
   });
   return {
     ok: result.status === 0,
-    finalText: result.finalMessage,
+    finalText:
+      result.status === 0
+        ? result.finalMessage
+        : appendTaskPermissionFailureGuidance(
+            info.id,
+            permission,
+            [result.finalMessage, result.stderr].filter(Boolean).join("\n").trim() || "Codex run failed."
+          ),
     sessionRef: result.threadId,
     threadId: result.threadId,
     turnId: result.turnId,

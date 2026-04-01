@@ -58,11 +58,14 @@ test("commands keep the unified /cc surface", () => {
 
   assert.match(rescue, /--engine <codex\|gemini\|droid>/);
   assert.match(rescue, /--model <id>/);
+  assert.match(rescue, /--permission <read-only\|edit\|dev\|full\|unsafe>/);
   assert.match(rescue, /task-resume-candidate --json/);
   assert.match(rescue, /Continue current engine thread/);
   assert.match(rescue, /Start a new engine thread/);
   assert.match(rescue, /default to foreground/i);
+  assert.match(rescue, /runtime-selection flags/i);
   assert.match(setup, /setup --json \$ARGUMENTS/);
+  assert.match(setup, /--permission <read-only\|edit\|dev\|full\|unsafe>/);
   assert.match(setup, /npm install -g @openai\/codex/);
   assert.match(setup, /!codex login/);
   assert.match(status, /\[--timeout-ms <ms>\]/);

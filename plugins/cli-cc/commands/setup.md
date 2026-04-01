@@ -1,6 +1,6 @@
 ---
 description: Detect Codex, Gemini, and Droid availability, manage the stop-time review gate, and store per-engine defaults.
-argument-hint: "[--engine <codex|gemini|droid>|--all] [--model <id>] [--effort none|minimal|low|medium|high|xhigh] [--enable-review-gate|--disable-review-gate]"
+argument-hint: "[--engine <codex|gemini|droid>|--all] [--model <id>] [--effort none|minimal|low|medium|high|xhigh] [--permission <read-only|edit|dev|full|unsafe>] [--enable-review-gate|--disable-review-gate]"
 allowed-tools: Bash, AskUserQuestion
 ---
 

@@ -10,7 +10,8 @@ const ENGINE_CAPABILITY_MATRIX = {
     interruptKind: "cooperative",
     streamingLevel: "rich",
     modelControl: "passthrough",
-    effortControl: "native"
+    effortControl: "native",
+    permissionControl: "dual-axis"
   },
   gemini: {
     supportsStructuredReview: true,
@@ -18,7 +19,8 @@ const ENGINE_CAPABILITY_MATRIX = {
     interruptKind: "process",
     streamingLevel: "basic",
     modelControl: "passthrough",
-    effortControl: "unsupported"
+    effortControl: "unsupported",
+    permissionControl: "approval-mode"
   },
   droid: {
     supportsStructuredReview: true,
@@ -26,7 +28,8 @@ const ENGINE_CAPABILITY_MATRIX = {
     interruptKind: "process",
     streamingLevel: "basic",
     modelControl: "passthrough",
-    effortControl: "mapped"
+    effortControl: "mapped",
+    permissionControl: "automation-level"
   }
 };
 

@@ -137,7 +137,7 @@ function taskPayload(prompt, resumed) {
   return "Handled the requested task.\\nTask prompt accepted.";
 }
 
-function emitTurnCompleted(threadId, turnId, items) {
+function emitTurnFinal(threadId, turnId, items, status = "completed") {
   send({ method: "turn/started", params: { threadId, turn: buildTurn(turnId) } });
   for (const item of items) {
     if (item.started) {
@@ -147,7 +147,7 @@ function emitTurnCompleted(threadId, turnId, items) {
       send({ method: "item/completed", params: { threadId, turnId, item: item.completed } });
     }
   }
-  send({ method: "turn/completed", params: { threadId, turn: buildTurn(turnId, "completed") } });
+  send({ method: "turn/completed", params: { threadId, turn: buildTurn(turnId, status) } });
 }
 
 const args = process.argv.slice(2);
@@ -223,7 +223,7 @@ rl.on("line", async (line) => {
         recordEvent(state, "review/start", message.params);
         const reviewText = process.env.FAKE_NATIVE_REVIEW_TEXT || "Reviewed current changes.\\nNo material issues found.";
         send({ id: message.id, result: { turn: buildTurn(turnId) } });
-        emitTurnCompleted(message.params.threadId, turnId, [
+        emitTurnFinal(message.params.threadId, turnId, [
           {
             started: { type: "enteredReviewMode", id: turnId, review: "current changes" }
           },
@@ -258,13 +258,17 @@ rl.on("line", async (line) => {
           threadId: message.params.threadId,
           model: message.params.model ?? null,
           effort: message.params.effort ?? null,
+          sandbox: message.params.sandbox ?? null,
           prompt,
           hasOutputSchema: Boolean(message.params.outputSchema)
         });
         const turnId = nextTurnId(state);
+        const permissionFailure = process.env.FAKE_CODEX_PERMISSION_ERROR === "1" && !prompt.includes("Return only valid JSON");
         const payload = prompt.includes("Return only valid JSON")
           ? structuredReviewPayload(prompt)
-          : taskPayload(prompt, false);
+          : permissionFailure
+            ? "Sandbox blocked write access in workspace-write mode."
+            : taskPayload(prompt, false);
         const delayMs = Number(process.env.FAKE_ENGINE_DELAY_MS || "0");
 
         send({ id: message.id, result: { turn: buildTurn(turnId) } });
@@ -276,7 +280,7 @@ rl.on("line", async (line) => {
             return;
           }
           entry.done = true;
-          emitTurnCompleted(message.params.threadId, turnId, [
+          emitTurnFinal(message.params.threadId, turnId, [
             {
               completed: {
                 type: "reasoning",
@@ -293,7 +297,7 @@ rl.on("line", async (line) => {
                 text: payload
               }
             }
-          ]);
+          ], permissionFailure ? "failed" : "completed");
         }, delayMs);
         break;
       }
@@ -471,6 +475,7 @@ async function main() {
   const outputFormat = getFlag(args, "--output-format", "-o") || "text";
   const sessionId = getFlag(args, "--session-id", "-s") || "droid-session-123";
   const prompt = args.at(-1) || "";
+  const permissionError = process.env.FAKE_DROID_PERMISSION_ERROR === "1" && !prompt.includes("Return only valid JSON");
   const delayMs = Number(process.env.FAKE_ENGINE_DELAY_MS || "0");
   const emitInitBeforeDelay = process.env.FAKE_DROID_INIT_BEFORE_DELAY === "1" && outputFormat === "stream-json";
   if (emitInitBeforeDelay) {
@@ -517,6 +522,8 @@ async function main() {
     response = process.env.FAKE_STOP_GATE_DECISION === "BLOCK"
       ? "BLOCK: A blocking issue was found in the previous turn."
       : "ALLOW: No blocking issues found in the previous turn.";
+  } else if (permissionError) {
+    response = "Exec ended early: insufficient permission to proceed. Re-run with --auto medium or --auto high. For destructive commands, use --skip-permissions-unsafe.";
   } else if (args.includes("--session-id") || args.includes("-s")) {
     response = "Droid resumed the prior session.";
   }
@@ -526,10 +533,16 @@ async function main() {
       process.stdout.write(JSON.stringify({ type: "system", subtype: "init", session_id: sessionId }) + "\\n");
     }
     process.stdout.write(JSON.stringify({ type: "completion", finalText: response, session_id: sessionId }) + "\\n");
+    if (permissionError) {
+      process.exit(1);
+    }
     return;
   }
 
   process.stdout.write(JSON.stringify({ finalText: response, session_id: sessionId }) + "\\n");
+  if (permissionError) {
+    process.exit(1);
+  }
 }
 
 main().catch((error) => {

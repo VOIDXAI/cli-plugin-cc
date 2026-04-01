@@ -42,7 +42,8 @@ function normalizeEngineDefaults(value) {
     }
     normalized[engine] = {
       model: typeof defaults.model === "string" && defaults.model.trim() ? defaults.model.trim() : null,
-      effort: typeof defaults.effort === "string" && defaults.effort.trim() ? defaults.effort.trim() : null
+      effort: typeof defaults.effort === "string" && defaults.effort.trim() ? defaults.effort.trim() : null,
+      permission: typeof defaults.permission === "string" && defaults.permission.trim() ? defaults.permission.trim() : null
     };
   }
   return normalized;
