@@ -7,12 +7,38 @@ export function makeTempDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "cli-plugin-cc-test-"));
 }
 
-export function run(command, args, options = {}) {
-  return spawnSync(command, args, {
+function buildSpawnOptions(options = {}, { includeTimeout = true } = {}) {
+  return {
     cwd: options.cwd,
     env: { ...process.env, ...(options.env ?? {}) },
     encoding: "utf8",
-    input: options.input
+    input: options.input,
+    timeout: includeTimeout ? options.timeout : undefined,
+    maxBuffer: options.maxBuffer ?? 10 * 1024 * 1024
+  };
+}
+
+export function run(command, args, options = {}) {
+  return spawnSync(command, args, buildSpawnOptions(options));
+}
+
+export function runWithHardTimeout(command, args, options = {}) {
+  const hardTimeoutSeconds = options.hardTimeoutSeconds ?? 600;
+  const killAfterSeconds = options.killAfterSeconds ?? 15;
+  const timeoutResult = spawnSync(
+    "timeout",
+    ["-k", `${killAfterSeconds}s`, `${hardTimeoutSeconds}s`, command, ...args],
+    buildSpawnOptions(options, { includeTimeout: false })
+  );
+
+  if (timeoutResult.error?.code !== "ENOENT") {
+    return timeoutResult;
+  }
+
+  return spawnSync(command, args, {
+    ...buildSpawnOptions(options, { includeTimeout: false }),
+    timeout: (hardTimeoutSeconds + killAfterSeconds) * 1000,
+    killSignal: "SIGKILL"
   });
 }
 

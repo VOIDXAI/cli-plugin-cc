@@ -9,22 +9,26 @@ import { fileURLToPath } from "node:url";
 import { parseArgs, splitRawArgumentString } from "./lib/args.mjs";
 import { getSessionRuntimeStatus } from "./lib/codex.mjs";
 import {
+  createEngineOwnerState,
   detectEngine,
+  engineEventToProgress,
+  getEngineInfo,
   findResumeCandidate,
+  getEngineRuntimeCapabilities,
   interruptEngineJob,
   listSupportedEngines,
   normalizeEngine,
-  runReview,
-  runTask
+  startEngineRun
 } from "./lib/engines.mjs";
 import {
   buildSingleJobSnapshot,
   buildStatusSnapshot,
+  listResumeCandidates,
   readStoredJob,
   resolveCancelableJob,
   resolveResultJob
 } from "./lib/job-control.mjs";
-import { terminateProcessTree } from "./lib/process.mjs";
+import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
 import {
   generateJobId,
   getConfig,
@@ -57,8 +61,7 @@ const SCRIPT_PATH = fileURLToPath(import.meta.url);
 const DEFAULT_STATUS_WAIT_TIMEOUT_MS = 240000;
 const DEFAULT_STATUS_POLL_INTERVAL_MS = 2000;
 const VALID_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
-
-function normalizeRequestedModel(model) {
+function normalizeRequestedModel(engine, model) {
   if (model == null) {
     return null;
   }
@@ -133,16 +136,37 @@ async function buildSetupReport(cwd, options = {}) {
   const config = getConfig(workspaceRoot);
   const requestedEngine = normalizeEngine(options.engine || config.defaultEngine);
   const engineIds = options.all ? listSupportedEngines().map((engine) => engine.id) : [requestedEngine];
+  const node = binaryAvailable("node", ["--version"], { cwd });
+  const npm = binaryAvailable("npm", ["--version"], { cwd });
   const engines = [];
 
   for (const id of engineIds) {
     engines.push(await detectEngine(id, cwd));
   }
 
+  const nextSteps = [];
+  for (const engine of engines) {
+    if (engine.id === "codex" && !engine.available && npm.available) {
+      nextSteps.push("Install Codex with `npm install -g @openai/codex`.");
+    }
+    if (engine.id === "codex" && engine.available && !engine.auth.loggedIn) {
+      nextSteps.push("Run `!codex login`.");
+      nextSteps.push("If browser login is blocked, retry with `!codex login --device-auth` or `!codex login --with-api-key`.");
+    }
+  }
+  if (!config.stopReviewGate) {
+    nextSteps.push(`Optional: run \`/cc:setup --engine ${requestedEngine} --enable-review-gate\` to require a fresh review before stop.`);
+  }
+
   return {
+    ready: node.available && engines.every((engine) => engine.available && engine.auth.loggedIn),
+    node,
+    npm,
+    selectedEngine: options.all ? null : requestedEngine,
     engines,
     config,
-    sessionRuntime: getSessionRuntimeStatus(process.env, workspaceRoot)
+    sessionRuntime: getSessionRuntimeStatus(process.env, workspaceRoot),
+    nextSteps
   };
 }
 
@@ -154,11 +178,38 @@ function getEngineDefaults(config, engine) {
   return config?.engineDefaults?.[engine] ?? {};
 }
 
-function applyEngineDefaults(options, defaults = {}) {
+function emitWarning(message) {
+  if (!message) {
+    return;
+  }
+  process.stderr.write(`Warning: ${message}\n`);
+}
+
+function resolveConfiguredEffort(engine, explicitEffort, defaultEffort = null, onWarning = null) {
+  const normalizedExplicitEffort = normalizeReasoningEffort(explicitEffort);
+  const normalizedDefaultEffort = normalizeReasoningEffort(defaultEffort);
+  const resolvedEffort = normalizedExplicitEffort ?? normalizedDefaultEffort;
+  const capabilities = getEngineRuntimeCapabilities(engine);
+
+  if (resolvedEffort == null) {
+    return null;
+  }
+  if (capabilities.effortControl === "native" || capabilities.effortControl === "mapped") {
+    return resolvedEffort;
+  }
+  if (normalizedExplicitEffort != null) {
+    onWarning?.(
+      `${getEngineInfo(engine).label} does not support \`--effort\` in this plugin because its CLI does not expose a reasoning-effort flag. Ignoring it.`
+    );
+  }
+  return null;
+}
+
+function applyEngineDefaults(engine, options, defaults = {}, onWarning = null) {
   return {
     ...options,
-    model: options.model ?? defaults.model ?? null,
-    effort: options.effort ?? defaults.effort ?? null
+    model: normalizeRequestedModel(engine, options.model ?? defaults.model ?? null),
+    effort: resolveConfiguredEffort(engine, options.effort, defaults.effort, onWarning)
   };
 }
 
@@ -167,6 +218,7 @@ function resolveBackground(options) {
 }
 
 function createBaseJob({ workspaceRoot, cwd, engine, jobClass, title, kindLabel = null, extra = {} }) {
+  const capabilities = getEngineRuntimeCapabilities(engine);
   const id = generateJobId(jobClass === "adversarial-review" ? "adv-review" : jobClass === "task" ? "task" : jobClass);
   const logFile = createJobLogFile(workspaceRoot, id, title);
   return createJobRecord({
@@ -181,6 +233,8 @@ function createBaseJob({ workspaceRoot, cwd, engine, jobClass, title, kindLabel 
     phase: "queued",
     logFile,
     pid: null,
+    capabilities,
+    ownerState: createEngineOwnerState(engine, "queued"),
     ...extra
   });
 }
@@ -197,7 +251,7 @@ function createReviewJob({ workspaceRoot, cwd, engine, kind, options, focusText 
       scope: options.scope || "auto",
       baseRef: options.base ?? null,
       focusText: focusText || null,
-      model: normalizeRequestedModel(options.model),
+      model: normalizeRequestedModel(engine, options.model),
       effort: normalizeReasoningEffort(options.effort)
     }
   });
@@ -217,7 +271,7 @@ function createTaskJob({ workspaceRoot, cwd, engine, options, prompt, readOnly =
       prompt,
       resume: Boolean(options.resume),
       resumeSessionRef: null,
-      model: normalizeRequestedModel(options.model),
+      model: normalizeRequestedModel(engine, options.model),
       effort: normalizeReasoningEffort(options.effort)
     }
   });
@@ -231,12 +285,10 @@ async function maybePopulateResumeSession(job) {
   const workspaceRoot = job.workspaceRoot;
   const config = getConfig(workspaceRoot);
   const engine = job.engine || config.defaultEngine;
-  const existingJobs = buildStatusSnapshot(workspaceRoot, { all: true }).running
-    .concat(buildStatusSnapshot(workspaceRoot, { all: true }).recent)
-    .concat(buildStatusSnapshot(workspaceRoot, { all: true }).latestFinished ? [buildStatusSnapshot(workspaceRoot, { all: true }).latestFinished] : []);
-  const previous = existingJobs.find(
-    (entry) => entry.id !== job.id && entry.engine === engine && entry.jobClass === "task" && (entry.sessionRef || entry.threadId)
-  );
+  const previous = listResumeCandidates(workspaceRoot, engine, {
+    all: false,
+    excludeJobId: job.id
+  })[0];
   if (previous) {
     return {
       ...job,
@@ -267,31 +319,42 @@ async function executeJob(job) {
   return runTrackedJob(
     job,
     async () => {
+      const handle = startEngineRun(
+        job.jobClass === "review" || job.jobClass === "adversarial-review"
+          ? {
+              engine: job.engine,
+              kind: job.jobClass,
+              cwd: job.workspaceRoot,
+              scope: job.scope,
+              baseRef: job.baseRef,
+              focusText: job.focusText,
+              model: job.model,
+              effort: job.effort
+            }
+          : {
+              engine: job.engine,
+              kind: "task",
+              cwd: job.workspaceRoot,
+              prompt: job.prompt,
+              resume: Boolean(job.resume),
+              resumeSessionRef: job.resumeSessionRef ?? null,
+              model: job.model,
+              effort: job.effort,
+              readOnly: Boolean(job.readOnly)
+            }
+      );
+
+      const pumpEvents = (async () => {
+        for await (const event of handle.events()) {
+          progressReporter?.(engineEventToProgress(event, job.engine));
+        }
+      })();
+
       let result;
-      if (job.jobClass === "review" || job.jobClass === "adversarial-review") {
-        result = await runReview({
-          engine: job.engine,
-          kind: job.jobClass,
-          cwd: job.workspaceRoot,
-          scope: job.scope,
-          baseRef: job.baseRef,
-          focusText: job.focusText,
-          model: job.model,
-          effort: job.effort,
-          onProgress: progressReporter
-        });
-      } else {
-        result = await runTask({
-          engine: job.engine,
-          cwd: job.workspaceRoot,
-          prompt: job.prompt,
-          resume: Boolean(job.resume),
-          resumeSessionRef: job.resumeSessionRef ?? null,
-          model: job.model,
-          effort: job.effort,
-          readOnly: Boolean(job.readOnly),
-          onProgress: progressReporter
-        });
+      try {
+        result = await handle.result();
+      } finally {
+        await pumpEvents;
       }
 
       const rendered =
@@ -310,7 +373,13 @@ async function executeJob(job) {
           firstMeaningfulLine(result.finalText, `${job.title} ${result.ok ? "completed" : "failed"}.`),
         threadId: result.threadId ?? null,
         turnId: result.turnId ?? null,
-        sessionRef: result.sessionRef ?? result.threadId ?? null
+        sessionRef: result.sessionRef ?? result.threadId ?? null,
+        capabilities: handle.capabilities,
+        ownerState: createEngineOwnerState(job.engine, result.ok ? "completed" : "failed", {
+          sessionRef: result.sessionRef ?? result.threadId ?? null,
+          threadId: result.threadId ?? null,
+          turnId: result.turnId ?? null
+        })
       };
     },
     {
@@ -367,6 +436,28 @@ async function waitForJobCompletion(cwd, reference, options = {}) {
   throw new Error(`Timed out waiting for job completion after ${Math.round(timeoutMs / 1000)}s.`);
 }
 
+function isActiveJobStatus(status) {
+  return status === "queued" || status === "running";
+}
+
+async function waitForSingleJobSnapshot(cwd, reference, options = {}) {
+  const timeoutMs = Math.max(0, Number(options.timeoutMs) || DEFAULT_STATUS_WAIT_TIMEOUT_MS);
+  const pollIntervalMs = Math.max(100, Number(options.pollIntervalMs) || DEFAULT_STATUS_POLL_INTERVAL_MS);
+  const deadline = Date.now() + timeoutMs;
+  let snapshot = buildSingleJobSnapshot(cwd, reference);
+
+  while (isActiveJobStatus(snapshot.job.status) && Date.now() < deadline) {
+    await sleep(Math.min(pollIntervalMs, Math.max(0, deadline - Date.now())));
+    snapshot = buildSingleJobSnapshot(cwd, reference);
+  }
+
+  return {
+    ...snapshot,
+    waitTimedOut: isActiveJobStatus(snapshot.job.status),
+    timeoutMs
+  };
+}
+
 async function handleSetup(argv) {
   const { options } = parseCommandInput(argv, {
     valueOptions: ["cwd", "engine", "model", "effort"],
@@ -398,14 +489,15 @@ async function handleSetup(argv) {
   }
 
   if (options.model != null || options.effort != null) {
+    const normalizedEffort = resolveConfiguredEffort(setupEngine, options.effort, null, emitWarning);
     const currentDefaults = getEngineDefaults(getConfig(workspaceRoot), setupEngine);
     setConfig(workspaceRoot, {
       engineDefaults: {
         ...(getConfig(workspaceRoot).engineDefaults ?? {}),
         [setupEngine]: {
           ...currentDefaults,
-          ...(options.model != null ? { model: normalizeRequestedModel(options.model) } : {}),
-          ...(options.effort != null ? { effort: normalizeReasoningEffort(options.effort) } : {})
+          ...(options.model != null ? { model: normalizeRequestedModel(setupEngine, options.model) } : {}),
+          ...(options.effort != null ? { effort: normalizedEffort } : {})
         }
       }
     });
@@ -424,14 +516,20 @@ async function handleReview(argv, kind) {
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const engine = resolveEngine(options, workspaceRoot);
-  const resolvedOptions = applyEngineDefaults(options, getEngineDefaults(getConfig(workspaceRoot), engine));
+  const focusText = positionals.join(" ").trim();
+  if (kind === "review" && focusText) {
+    throw new Error(
+      `\`/cc:review\` does not support custom focus text. Retry with \`/cc:adversarial-review --engine ${engine} ${focusText}\` for focused review instructions.`
+    );
+  }
+  const resolvedOptions = applyEngineDefaults(engine, options, getEngineDefaults(getConfig(workspaceRoot), engine), emitWarning);
   const job = createReviewJob({
     workspaceRoot,
     cwd,
     engine,
     kind,
     options: resolvedOptions,
-    focusText: positionals.join(" ").trim()
+    focusText
   });
 
   if (resolveBackground(options)) {
@@ -442,6 +540,7 @@ async function handleReview(argv, kind) {
   }
 
   const execution = await executeJob(job);
+  process.exitCode = execution.exitStatus;
   outputResult(options.json ? execution.payload : execution.rendered, Boolean(options.json));
 }
 
@@ -458,7 +557,7 @@ async function handleTask(argv, { jobClass = "task", readOnly = false } = {}) {
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const engine = resolveEngine(options, workspaceRoot);
-  const resolvedOptions = applyEngineDefaults(options, getEngineDefaults(getConfig(workspaceRoot), engine));
+  const resolvedOptions = applyEngineDefaults(engine, options, getEngineDefaults(getConfig(workspaceRoot), engine), emitWarning);
   let job = createTaskJob({
     workspaceRoot,
     cwd,
@@ -479,34 +578,57 @@ async function handleTask(argv, { jobClass = "task", readOnly = false } = {}) {
   }
 
   const execution = await executeJob(job);
+  process.exitCode = execution.exitStatus;
   outputResult(options.json ? execution.payload : execution.rendered, Boolean(options.json));
 }
 
 async function handleStatus(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["cwd", "timeout-ms", "poll-ms"],
+    valueOptions: ["cwd", "timeout-ms", "poll-ms", "poll-interval-ms"],
     booleanOptions: ["json", "all", "wait"]
   });
 
   const cwd = resolveCommandCwd(options);
   const reference = positionals[0] ?? null;
 
-  const snapshot = options.wait
-    ? await waitForJobCompletion(cwd, reference, {
-        all: Boolean(options.all),
-        timeoutMs: options["timeout-ms"],
-        pollMs: options["poll-ms"]
-      })
-    : reference
-      ? buildSingleJobSnapshot(cwd, reference)
-      : buildStatusSnapshot(cwd, { all: Boolean(options.all) });
-
-  if ("job" in snapshot) {
+  if (reference) {
+    const snapshot = options.wait
+      ? await waitForSingleJobSnapshot(cwd, reference, {
+          timeoutMs: options["timeout-ms"],
+          pollIntervalMs: options["poll-interval-ms"] ?? options["poll-ms"]
+        })
+      : buildSingleJobSnapshot(cwd, reference);
     outputResult(options.json ? snapshot : renderJobStatusReport(snapshot.job), Boolean(options.json));
     return;
   }
 
+  if (options.wait) {
+    throw new Error("`status --wait` requires a job id.");
+  }
+
+  const snapshot = buildStatusSnapshot(cwd, { all: Boolean(options.all) });
   outputResult(options.json ? snapshot : renderStatusReport(snapshot), Boolean(options.json));
+}
+
+function handleTaskResumeCandidate(argv) {
+  const { options } = parseCommandInput(argv, {
+    valueOptions: ["cwd", "engine"],
+    booleanOptions: ["json", "all"]
+  });
+
+  const cwd = resolveCommandCwd(options);
+  const workspaceRoot = resolveWorkspaceRoot(cwd);
+  const engine = normalizeEngine(options.engine || getConfig(workspaceRoot).defaultEngine);
+  const candidates = listResumeCandidates(workspaceRoot, engine, {
+    all: Boolean(options.all)
+  });
+  const payload = {
+    available: candidates.length > 0,
+    sessionId: process.env.CLI_PLUGIN_CC_SESSION_ID ?? null,
+    engine,
+    candidate: candidates[0] ?? null
+  };
+  outputResult(options.json ? payload : JSON.stringify(payload, null, 2), Boolean(options.json));
 }
 
 async function handleResult(argv) {
@@ -618,6 +740,9 @@ async function main() {
       return;
     case "status":
       await handleStatus(argv);
+      return;
+    case "task-resume-candidate":
+      handleTaskResumeCandidate(argv);
       return;
     case "result":
       await handleResult(argv);

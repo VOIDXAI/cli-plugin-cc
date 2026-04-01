@@ -788,9 +788,13 @@ export function parseStructuredOutput(rawOutput, fallback = {}) {
     };
   }
 
+  const normalizedOutput = String(rawOutput).trim();
+  const fencedMatch = normalizedOutput.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+  const candidate = fencedMatch ? fencedMatch[1].trim() : normalizedOutput;
+
   try {
     return {
-      parsed: JSON.parse(rawOutput),
+      parsed: JSON.parse(candidate),
       parseError: null,
       rawOutput,
       ...fallback

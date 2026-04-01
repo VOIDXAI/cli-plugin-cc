@@ -3,7 +3,9 @@ import assert from "node:assert/strict";
 
 import {
   ENGINE_ADAPTERS,
+  createEngineOwnerState,
   getEngineInfo,
+  getEngineRuntimeCapabilities,
   listSupportedEngines,
   normalizeEngine,
   supportsGate
@@ -22,6 +24,7 @@ test("engine registry exposes the expected adapters", () => {
 test("each engine adapter implements the shared adapter surface", () => {
   for (const adapter of Object.values(ENGINE_ADAPTERS)) {
     assert.equal(typeof adapter.detect, "function");
+    assert.equal(typeof adapter.startRun, "function");
     assert.equal(typeof adapter.review, "function");
     assert.equal(typeof adapter.task, "function");
     assert.equal(typeof adapter.resume, "function");
@@ -35,4 +38,7 @@ test("engine facade helpers stay stable", () => {
   assert.equal(normalizeEngine(), "codex");
   assert.equal(getEngineInfo("codex").label, "Codex");
   assert.equal(supportsGate("gemini"), true);
+  assert.equal(getEngineRuntimeCapabilities("droid").resumeKind, "session");
+  assert.equal(getEngineRuntimeCapabilities("gemini").effortControl, "unsupported");
+  assert.equal(createEngineOwnerState("codex", "running").cancelStrategy, "cooperative");
 });

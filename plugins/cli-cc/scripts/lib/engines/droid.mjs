@@ -1,6 +1,7 @@
 import { parseStructuredOutput } from "../codex.mjs";
 import {
   commandExists,
+  createDroidStreamObserver,
   ENGINE_INFO,
   engineBin,
   envAuthStatus,
@@ -10,13 +11,16 @@ import {
   resolveReviewRequest,
   runProcess
 } from "./shared.mjs";
+import { buildCompletedEvent, createEngineRunController, getEngineCapabilities } from "./runtime.mjs";
 
 const info = ENGINE_INFO.droid;
+const runtimeCapabilities = getEngineCapabilities(info.id);
 
 function capabilities() {
   return {
     gate: info.supportsGate,
-    resume: info.resume
+    resume: info.resume,
+    ...runtimeCapabilities
   };
 }
 
@@ -32,7 +36,19 @@ async function detect() {
   };
 }
 
-async function review({ kind, cwd, scope, baseRef, focusText, model, effort }) {
+async function runDroidCommand({ cwd, args, onEvent }) {
+  const observer = createDroidStreamObserver(onEvent);
+  const result = await runProcess({
+    command: engineBin(info.id),
+    args,
+    cwd,
+    onStdout: (chunk) => observer.pushStdout(chunk)
+  });
+  observer.flush();
+  return result;
+}
+
+async function runReviewInternal({ kind, cwd, scope, baseRef, focusText, model, effort, onEvent }) {
   const { target, prompt } = resolveReviewRequest({ cwd, scope, baseRef, kind, focusText });
   const args = ["exec", "--cwd", cwd, "--output-format", "stream-json"];
   if (model) {
@@ -44,11 +60,7 @@ async function review({ kind, cwd, scope, baseRef, focusText, model, effort }) {
   }
   args.push(prompt);
 
-  const result = await runProcess({
-    command: engineBin(info.id),
-    args,
-    cwd
-  });
+  const result = await runDroidCommand({ cwd, args, onEvent });
   const payload = parseDroidStreamJson(result.stdout);
   const parsed = parseStructuredOutput(payload.finalText);
   return {
@@ -71,7 +83,7 @@ function buildTaskPrompt({ prompt, cwd }) {
   ].join("\n");
 }
 
-async function task({ cwd, prompt, model, effort, readOnly = false }) {
+async function runTaskInternal({ cwd, prompt, model, effort, readOnly = false, onEvent }) {
   const args = ["exec", "--cwd", cwd, "--output-format", "stream-json"];
   if (!readOnly) {
     args.push("--auto", "low");
@@ -85,11 +97,7 @@ async function task({ cwd, prompt, model, effort, readOnly = false }) {
   }
   args.push(buildTaskPrompt({ prompt, cwd }));
 
-  const result = await runProcess({
-    command: engineBin(info.id),
-    args,
-    cwd
-  });
+  const result = await runDroidCommand({ cwd, args, onEvent });
   const payload = parseDroidStreamJson(result.stdout);
   return {
     ok: result.code === 0,
@@ -98,7 +106,7 @@ async function task({ cwd, prompt, model, effort, readOnly = false }) {
   };
 }
 
-async function resume({ cwd, prompt, resumeSessionRef, model, effort, readOnly = false }) {
+async function runResumeInternal({ cwd, prompt, resumeSessionRef, model, effort, readOnly = false, onEvent }) {
   const args = ["exec", "--cwd", cwd, "--output-format", "stream-json"];
   if (!readOnly) {
     args.push("--auto", "low");
@@ -115,17 +123,119 @@ async function resume({ cwd, prompt, resumeSessionRef, model, effort, readOnly =
   }
   args.push(buildTaskPrompt({ prompt, cwd }));
 
-  const result = await runProcess({
-    command: engineBin(info.id),
-    args,
-    cwd
-  });
+  const result = await runDroidCommand({ cwd, args, onEvent });
   const payload = parseDroidStreamJson(result.stdout);
   return {
     ok: result.code === 0,
     finalText: payload.finalText,
     sessionRef: payload.sessionRef
   };
+}
+
+function attachCapabilities(result, raw = null) {
+  return {
+    ...result,
+    capabilities: capabilities(),
+    raw
+  };
+}
+
+function emitLifecycle(controller, result, options = {}) {
+  if (options.includeSessionReady !== false && result.sessionRef) {
+    controller.emit({
+      type: "session_ready",
+      phase: "starting",
+      message: "Droid session ready.",
+      sessionRef: result.sessionRef
+    });
+  }
+  if (result.structured) {
+    controller.emit({
+      type: "structured_review",
+      phase: "finalizing",
+      message: "Structured review output captured.",
+      sessionRef: result.sessionRef ?? null,
+      payload: result.structured
+    });
+  }
+  controller.emit({
+    type: result.ok ? "final_text" : "failure",
+    phase: result.ok ? "finalizing" : "failed",
+    message: result.ok ? "Droid final output captured." : "Droid run failed.",
+    sessionRef: result.sessionRef ?? null,
+    logTitle: result.ok ? "Final output" : "Failure",
+    logBody: result.finalText ?? ""
+  });
+  controller.emit(buildCompletedEvent(result, "droid"));
+}
+
+function startRun(request) {
+  const state = {
+    sessionReadyEmitted: false
+  };
+  const controller = createEngineRunController({
+    engine: info.id,
+    request,
+    capabilities: capabilities(),
+    cancel: async () => await interrupt()
+  });
+
+  controller.emit({
+    type: "run_started",
+    phase: "starting",
+    message:
+      request.kind === "review" || request.kind === "adversarial-review"
+        ? "Invoking Droid CLI for review."
+        : "Invoking Droid CLI for task."
+  });
+
+  const onEvent = (event) => {
+    if (event?.type === "session_ready") {
+      state.sessionReadyEmitted = true;
+    }
+    controller.emit(event);
+  };
+
+  void (async () => {
+    try {
+      const result =
+        request.kind === "review" || request.kind === "adversarial-review"
+          ? await runReviewInternal({ ...request, onEvent })
+          : request.resume
+            ? await runResumeInternal({ ...request, onEvent })
+            : await runTaskInternal({ ...request, onEvent });
+
+      const normalized = attachCapabilities(result, {
+        sessionRef: result.sessionRef ?? null
+      });
+      emitLifecycle(controller, normalized, {
+        includeSessionReady: !state.sessionReadyEmitted
+      });
+      controller.resolve(normalized);
+    } catch (error) {
+      controller.emit({
+        type: "failure",
+        phase: "failed",
+        message: error instanceof Error ? error.message : String(error)
+      });
+      controller.emit(buildCompletedEvent({ ok: false }, "droid"));
+      controller.reject(error);
+    }
+  })();
+
+  return controller.handle;
+}
+
+async function review(args) {
+  return startRun(args).result();
+}
+
+async function task(args) {
+  return startRun({ ...args, resume: false }).result();
+}
+
+async function resume(args) {
+  return startRun({ ...args, resume: true }).result();
 }
 
 async function interrupt() {
@@ -140,6 +250,7 @@ export const droidAdapter = {
   id: info.id,
   info,
   detect,
+  startRun,
   review,
   task,
   resume,

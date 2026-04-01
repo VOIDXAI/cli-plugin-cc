@@ -209,11 +209,208 @@ export function parseDroidStreamJson(raw) {
   };
 }
 
-export function parseGeminiJsonOutput(raw) {
-  const parsed = parseMaybeJson(String(raw ?? "").trim()) ?? {};
+export function createChunkLineCollector(onLine) {
+  let buffer = "";
+
+  function flushLine(line) {
+    const normalized = String(line ?? "").trim();
+    if (normalized) {
+      onLine(normalized);
+    }
+  }
+
+  return {
+    push(chunk) {
+      buffer += String(chunk ?? "");
+      let index = buffer.indexOf("\n");
+      while (index >= 0) {
+        const line = buffer.slice(0, index);
+        buffer = buffer.slice(index + 1);
+        flushLine(line);
+        index = buffer.indexOf("\n");
+      }
+    },
+    flush() {
+      if (!buffer.trim()) {
+        buffer = "";
+        return;
+      }
+      flushLine(buffer);
+      buffer = "";
+    }
+  };
+}
+
+function readEventTextFields(source) {
+  if (!source || typeof source !== "object" || Array.isArray(source)) {
+    return null;
+  }
+
+  const directMessage =
+    typeof source.message === "string" && source.message.trim()
+      ? source.message.trim()
+      : typeof source.text === "string" && source.text.trim()
+        ? source.text.trim()
+        : typeof source.summary === "string" && source.summary.trim()
+          ? source.summary.trim()
+          : typeof source.title === "string" && source.title.trim()
+            ? source.title.trim()
+            : null;
+  if (directMessage) {
+    return directMessage;
+  }
+
+  if (Array.isArray(source.content)) {
+    const text = source.content.find((entry) => entry && typeof entry.text === "string" && entry.text.trim());
+    if (text?.text) {
+      return text.text.trim();
+    }
+  }
+
+  return null;
+}
+
+export function createDroidStreamObserver(onEvent) {
+  let sessionRef = null;
+  const collector = createChunkLineCollector((line) => {
+    const parsed = parseMaybeJson(line);
+    if (!parsed) {
+      onEvent?.({
+        type: "progress",
+        phase: "running",
+        message: line
+      });
+      return;
+    }
+
+    if (parsed.session_id && parsed.session_id !== sessionRef) {
+      sessionRef = parsed.session_id;
+      onEvent?.({
+        type: "session_ready",
+        phase: "starting",
+        message: "Droid session ready.",
+        sessionRef
+      });
+    }
+
+    if (parsed.type === "completion") {
+      return;
+    }
+
+    const message = readEventTextFields(parsed);
+    if (message) {
+      onEvent?.({
+        type: parsed.type === "tool_call" || parsed.type === "tool" ? "tool_activity" : "progress",
+        phase: parsed.type === "tool_call" || parsed.type === "tool" ? "running" : "investigating",
+        message,
+        sessionRef
+      });
+    }
+  });
+
+  return {
+    pushStdout(chunk) {
+      collector.push(chunk);
+    },
+    flush() {
+      collector.flush();
+    }
+  };
+}
+
+export function createGeminiCliObserver(onEvent) {
+  let sessionRef = null;
+
+  function handleLine(line, source) {
+    const parsed = parseMaybeJson(line);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const nextSessionRef = parsed.session_id ?? parsed.sessionId ?? null;
+      if (nextSessionRef && nextSessionRef !== sessionRef) {
+        sessionRef = nextSessionRef;
+        onEvent?.({
+          type: "session_ready",
+          phase: "starting",
+          message: "Gemini session ready.",
+          sessionRef
+        });
+      }
+      return;
+    }
+
+    onEvent?.({
+      type: source === "stderr" ? "warning" : "progress",
+      phase: source === "stderr" ? "running" : "investigating",
+      message: line,
+      stderrMessage: source === "stderr" ? line : null,
+      sessionRef
+    });
+  }
+
+  const stdoutCollector = createChunkLineCollector((line) => handleLine(line, "stdout"));
+  const stderrCollector = createChunkLineCollector((line) => handleLine(line, "stderr"));
+
+  return {
+    pushStdout(chunk) {
+      stdoutCollector.push(chunk);
+    },
+    pushStderr(chunk) {
+      stderrCollector.push(chunk);
+    },
+    flush() {
+      stdoutCollector.flush();
+      stderrCollector.flush();
+    }
+  };
+}
+
+export function extractTrailingJsonObject(raw) {
+  const text = String(raw ?? "").trim();
+  if (!text) {
+    return null;
+  }
+
+  const candidateIndexes = [];
+  if (text.startsWith("{")) {
+    candidateIndexes.push(0);
+  }
+
+  const lineStartJson = /\n\{/g;
+  let match;
+  while ((match = lineStartJson.exec(text)) !== null) {
+    candidateIndexes.push(match.index + 1);
+  }
+
+  for (let index = candidateIndexes.length - 1; index >= 0; index -= 1) {
+    const candidate = text.slice(candidateIndexes[index]).trim();
+    const parsed = parseMaybeJson(candidate);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return {
+        parsed,
+        raw: candidate
+      };
+    }
+  }
+
+  return null;
+}
+
+export function parseGeminiJsonOutput(raw, stderr = "") {
+  const stdoutText = String(raw ?? "").trim();
+  const stderrText = String(stderr ?? "").trim();
+  const combinedText = [stdoutText, stderrText].filter(Boolean).join("\n");
+  const extracted =
+    extractTrailingJsonObject(stdoutText) ??
+    extractTrailingJsonObject(combinedText) ??
+    null;
+  const parsed = extracted?.parsed ?? {};
+
+  const errorMessage =
+    typeof parsed?.error?.message === "string" && parsed.error.message.trim() ? parsed.error.message.trim() : null;
+  const responseText = typeof parsed?.response === "string" && parsed.response.trim() ? parsed.response.trim() : null;
+
   return {
     parsed,
-    finalText: parsed.response ?? String(raw ?? "").trim(),
+    finalText: responseText ?? errorMessage ?? stdoutText ?? stderrText,
     sessionRef: parsed.session_id ?? parsed.sessionId ?? null
   };
 }
@@ -223,11 +420,24 @@ export function normalizeReviewPayload(payload) {
     return null;
   }
 
-  if (typeof payload.verdict !== "string" || !Array.isArray(payload.findings)) {
+  const sourceFindings = Array.isArray(payload.findings)
+    ? payload.findings
+    : Array.isArray(payload.reviews)
+      ? payload.reviews
+      : Array.isArray(payload.sub_findings)
+        ? payload.sub_findings
+        : null;
+  const verdict =
+    typeof payload.verdict === "string"
+      ? payload.verdict
+      : typeof payload.decision === "string"
+        ? payload.decision
+        : null;
+  if (!verdict || !sourceFindings) {
     return null;
   }
 
-  const findings = payload.findings.map((finding, index) => {
+  const findings = sourceFindings.map((finding, index) => {
     const source = finding && typeof finding === "object" ? finding : {};
     return {
       severity:
@@ -248,10 +458,35 @@ export function normalizeReviewPayload(payload) {
             ? source.summary
             : typeof source.description === "string"
               ? source.description
+              : typeof source.message === "string"
+                ? source.message
+                : typeof source.review_comment === "string"
+                  ? source.review_comment
               : "No details provided.",
-      file: typeof source.file === "string" ? source.file : "unknown",
-      line_start: Number.isInteger(source.line_start) ? source.line_start : null,
-      line_end: Number.isInteger(source.line_end) ? source.line_end : null,
+      file:
+        typeof source.file === "string"
+          ? source.file
+          : typeof source.range?.file === "string"
+            ? source.range.file
+            : typeof source.file_path === "string"
+              ? source.file_path
+            : "unknown",
+      line_start:
+        Number.isInteger(source.line_start)
+          ? source.line_start
+          : Number.isInteger(source.range?.start_line)
+            ? source.range.start_line
+            : Number.isInteger(source.line_number)
+              ? source.line_number
+            : null,
+      line_end:
+        Number.isInteger(source.line_end)
+          ? source.line_end
+          : Number.isInteger(source.range?.end_line)
+            ? source.range.end_line
+            : Number.isInteger(source.line_number)
+              ? source.line_number
+            : null,
       confidence:
         typeof source.confidence === "number"
           ? source.confidence
@@ -263,10 +498,14 @@ export function normalizeReviewPayload(payload) {
   });
 
   return {
-    verdict: payload.verdict,
+    verdict,
     summary:
       typeof payload.summary === "string" && payload.summary.trim()
         ? payload.summary
+        : typeof payload.comment === "string" && payload.comment.trim()
+          ? payload.comment
+          : typeof payload.reason === "string" && payload.reason.trim()
+            ? payload.reason
         : findings.length > 0
           ? `${findings.length} material finding(s) reported.`
           : "No material issues found.",
@@ -275,7 +514,19 @@ export function normalizeReviewPayload(payload) {
   };
 }
 
-export function runProcess({ command, args, cwd, input, env, onStdout, onStderr }) {
+export function quoteShellArg(value) {
+  const text = String(value ?? "");
+  if (!text) {
+    return "''";
+  }
+  return `'${text.replace(/'/g, `'\\''`)}'`;
+}
+
+export function buildShellCommand(command, args = []) {
+  return [command, ...args].map(quoteShellArg).join(" ");
+}
+
+export function runProcess({ command, args, cwd, input, env, onStdout, onStderr, abortOnOutput }) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
       cwd,
@@ -285,26 +536,94 @@ export function runProcess({ command, args, cwd, input, env, onStdout, onStderr 
 
     let stdout = "";
     let stderr = "";
+    let aborted = false;
+    let abortReason = null;
+
+    const triggerAbort = (source, chunk) => {
+      if (aborted || typeof abortOnOutput !== "function") {
+        return;
+      }
+
+      const maybeReason = abortOnOutput({
+        source,
+        chunk,
+        stdout,
+        stderr,
+        combined: [stdout, stderr].filter(Boolean).join("\n")
+      });
+
+      if (!maybeReason) {
+        return;
+      }
+
+      aborted = true;
+      abortReason = typeof maybeReason === "string" ? maybeReason : "aborted";
+      child.kill("SIGTERM");
+      const killTimer = setTimeout(() => {
+        if (!child.killed) {
+          child.kill("SIGKILL");
+        }
+      }, 1000);
+      killTimer.unref?.();
+    };
 
     child.stdout.on("data", (chunk) => {
       const text = chunk.toString();
       stdout += text;
       onStdout?.(text);
+      triggerAbort("stdout", text);
     });
 
     child.stderr.on("data", (chunk) => {
       const text = chunk.toString();
       stderr += text;
       onStderr?.(text);
+      triggerAbort("stderr", text);
     });
 
     child.on("error", reject);
-    child.on("exit", (code, signal) => resolve({ code, signal, stdout, stderr }));
+    child.on("close", (code, signal) => resolve({ code, signal, stdout, stderr, aborted, abortReason }));
 
     if (input) {
       child.stdin.write(input);
     }
     child.stdin.end();
+  });
+}
+
+let hasScriptPromise = null;
+
+export async function supportsScriptPty() {
+  if (process.platform === "win32") {
+    return false;
+  }
+  if (!hasScriptPromise) {
+    hasScriptPromise = commandExists("script");
+  }
+  return hasScriptPromise;
+}
+
+export async function runProcessWithScriptPty({ command, args, cwd, env, onStdout, onStderr, abortOnOutput }) {
+  if (!(await supportsScriptPty())) {
+    return runProcess({
+      command,
+      args,
+      cwd,
+      env,
+      onStdout,
+      onStderr,
+      abortOnOutput
+    });
+  }
+
+  return runProcess({
+    command: "script",
+    args: ["-qefc", buildShellCommand(command, args), "/dev/null"],
+    cwd,
+    env,
+    onStdout,
+    onStderr,
+    abortOnOutput
   });
 }
 

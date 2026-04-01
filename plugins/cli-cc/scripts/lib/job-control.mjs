@@ -211,6 +211,28 @@ function matchJobReference(jobs, reference, predicate = () => true, options = {}
   throw new Error(`No job found for "${reference}". Run ${prefix} to list known jobs.`);
 }
 
+function findJobReference(jobs, reference, predicate = () => true) {
+  const filtered = jobs.filter(predicate);
+  if (!reference) {
+    return filtered[0] ?? null;
+  }
+
+  const exact = filtered.find((job) => job.id === reference);
+  if (exact) {
+    return exact;
+  }
+
+  const prefixMatches = filtered.filter((job) => job.id.startsWith(reference));
+  if (prefixMatches.length === 1) {
+    return prefixMatches[0];
+  }
+  if (prefixMatches.length > 1) {
+    throw new Error(`Job reference "${reference}" is ambiguous. Use a longer job id.`);
+  }
+
+  return null;
+}
+
 export function buildStatusSnapshot(cwd, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const config = getConfig(workspaceRoot);
@@ -258,27 +280,50 @@ export function buildSingleJobSnapshot(cwd, reference, options = {}) {
   };
 }
 
+export function listResumeCandidates(cwd, engine, options = {}) {
+  const workspaceRoot = resolveWorkspaceRoot(cwd);
+  const jobs = sortJobsNewestFirst(
+    options.all ? listJobs(workspaceRoot) : filterJobsForCurrentSession(listJobs(workspaceRoot), options)
+  );
+
+  return jobs
+    .filter(
+      (job) =>
+        job.id !== options.excludeJobId &&
+        job.engine === engine &&
+        job.jobClass === "task" &&
+        (job.threadId || job.sessionRef) &&
+        job.status !== "queued" &&
+        job.status !== "running"
+    )
+    .map((job) => enrichJob(job, { maxProgressLines: options.maxProgressLines }));
+}
+
 export function resolveResultJob(cwd, reference, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const jobs = sortJobsNewestFirst(
     reference || options.all ? listJobs(workspaceRoot) : filterJobsForCurrentSession(listJobs(workspaceRoot), options)
   );
-  const selected = matchJobReference(
+  const selected = findJobReference(
     jobs,
     reference,
-    (job) => job.status === "completed" || job.status === "failed" || job.status === "cancelled",
-    { commandPrefix: "/cc:status" }
+    (job) => job.status === "completed" || job.status === "failed" || job.status === "cancelled"
   );
 
   if (selected) {
     return { workspaceRoot, job: selected };
   }
 
-  const active = matchJobReference(jobs, reference, (job) => job.status === "queued" || job.status === "running", {
-    commandPrefix: "/cc:status"
-  });
+  const active = findJobReference(jobs, reference, (job) => job.status === "queued" || job.status === "running");
   if (active) {
     throw new Error(`Job ${active.id} is still ${active.status}. Check /cc:status and try again once it finishes.`);
+  }
+
+  if (reference) {
+    const duplicates = jobs.filter((job) => job.id.startsWith(reference));
+    if (duplicates.length > 1) {
+      throw new Error(`Job reference "${reference}" is ambiguous. Use a longer job id.`);
+    }
   }
 
   if (reference) {

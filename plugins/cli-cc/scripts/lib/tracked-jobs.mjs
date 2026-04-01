@@ -14,22 +14,26 @@ function normalizeProgressEvent(value) {
     return {
       message: String(value.message ?? "").trim(),
       phase: typeof value.phase === "string" && value.phase.trim() ? value.phase.trim() : null,
+      sessionRef: typeof value.sessionRef === "string" && value.sessionRef.trim() ? value.sessionRef.trim() : null,
       threadId: typeof value.threadId === "string" && value.threadId.trim() ? value.threadId.trim() : null,
       turnId: typeof value.turnId === "string" && value.turnId.trim() ? value.turnId.trim() : null,
       stderrMessage: value.stderrMessage == null ? null : String(value.stderrMessage).trim(),
       logTitle: typeof value.logTitle === "string" && value.logTitle.trim() ? value.logTitle.trim() : null,
-      logBody: value.logBody == null ? null : String(value.logBody).trimEnd()
+      logBody: value.logBody == null ? null : String(value.logBody).trimEnd(),
+      ownerState: value.ownerState && typeof value.ownerState === "object" && !Array.isArray(value.ownerState) ? value.ownerState : null
     };
   }
 
   return {
     message: String(value ?? "").trim(),
     phase: null,
+    sessionRef: null,
     threadId: null,
     turnId: null,
     stderrMessage: String(value ?? "").trim(),
     logTitle: null,
-    logBody: null
+    logBody: null,
+    ownerState: null
   };
 }
 
@@ -69,8 +73,10 @@ export function createJobRecord(base, options = {}) {
 
 export function createJobProgressUpdater(workspaceRoot, jobId) {
   let lastPhase = null;
+  let lastSessionRef = null;
   let lastThreadId = null;
   let lastTurnId = null;
+  let lastOwnerStateKey = null;
 
   return (event) => {
     const normalized = normalizeProgressEvent(event);
@@ -80,6 +86,12 @@ export function createJobProgressUpdater(workspaceRoot, jobId) {
     if (normalized.phase && normalized.phase !== lastPhase) {
       lastPhase = normalized.phase;
       patch.phase = normalized.phase;
+      changed = true;
+    }
+
+    if (normalized.sessionRef && normalized.sessionRef !== lastSessionRef) {
+      lastSessionRef = normalized.sessionRef;
+      patch.sessionRef = normalized.sessionRef;
       changed = true;
     }
 
@@ -93,6 +105,15 @@ export function createJobProgressUpdater(workspaceRoot, jobId) {
       lastTurnId = normalized.turnId;
       patch.turnId = normalized.turnId;
       changed = true;
+    }
+
+    if (normalized.ownerState) {
+      const ownerStateKey = JSON.stringify(normalized.ownerState);
+      if (ownerStateKey !== lastOwnerStateKey) {
+        lastOwnerStateKey = ownerStateKey;
+        patch.ownerState = normalized.ownerState;
+        changed = true;
+      }
     }
 
     if (!changed) {
@@ -146,6 +167,7 @@ export async function runTrackedJob(job, runner, options = {}) {
     startedAt: nowIso(),
     phase: "starting",
     pid: process.pid,
+    ownerState: job.ownerState ? { ...job.ownerState, state: "running" } : null,
     logFile: options.logFile ?? job.logFile ?? null
   };
   writeJobFile(job.workspaceRoot, job.id, runningRecord);
@@ -164,6 +186,18 @@ export async function runTrackedJob(job, runner, options = {}) {
       pid: null,
       phase: completionStatus === "completed" ? "done" : completionStatus,
       completedAt,
+      capabilities: execution.capabilities ?? runningRecord.capabilities ?? null,
+      ownerState:
+        execution.ownerState ??
+        (runningRecord.ownerState
+          ? {
+              ...runningRecord.ownerState,
+              state: completionStatus,
+              sessionRef: execution.sessionRef ?? runningRecord.sessionRef ?? null,
+              threadId: execution.threadId ?? runningRecord.threadId ?? null,
+              turnId: execution.turnId ?? runningRecord.turnId ?? null
+            }
+          : null),
       result: execution.payload,
       rendered: execution.rendered,
       summary: execution.summary ?? runningRecord.summary ?? null,
@@ -177,6 +211,8 @@ export async function runTrackedJob(job, runner, options = {}) {
       sessionRef: execution.sessionRef ?? null,
       summary: execution.summary,
       phase: completionStatus === "completed" ? "done" : completionStatus,
+      capabilities: execution.capabilities ?? null,
+      ownerState: execution.ownerState ?? null,
       pid: null,
       completedAt
     });
@@ -193,12 +229,14 @@ export async function runTrackedJob(job, runner, options = {}) {
       errorMessage,
       pid: null,
       completedAt,
+      ownerState: existing.ownerState ? { ...existing.ownerState, state: "failed" } : existing.ownerState ?? null,
       logFile: options.logFile ?? job.logFile ?? existing.logFile ?? null
     });
     upsertJob(job.workspaceRoot, {
       id: job.id,
       status: "failed",
       phase: "failed",
+      ownerState: existing.ownerState ? { ...existing.ownerState, state: "failed" } : existing.ownerState ?? null,
       pid: null,
       errorMessage,
       completedAt

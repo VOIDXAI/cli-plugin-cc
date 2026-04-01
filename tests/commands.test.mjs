@@ -11,28 +11,62 @@ function read(relativePath) {
   return fs.readFileSync(path.join(PLUGIN_ROOT, relativePath), "utf8");
 }
 
-test("commands expose a unified /cc surface with --engine", () => {
-  const review = read("commands/review.md");
-  const adversarialReview = read("commands/adversarial-review.md");
+test("review command uses AskUserQuestion and background Bash while staying review-only", () => {
+  const source = read("commands/review.md");
+
+  assert.match(source, /disable-model-invocation:\s*true/);
+  assert.match(source, /AskUserQuestion/);
+  assert.match(source, /\bBash\(/);
+  assert.match(source, /review-only/i);
+  assert.match(source, /Do not fix issues/i);
+  assert.match(source, /return the engine output verbatim to the user/i);
+  assert.match(source, /review "\$ARGUMENTS"/);
+  assert.match(source, /--engine <codex\|gemini\|droid>/);
+  assert.match(source, /\[--scope auto\|working-tree\|branch\]/);
+  assert.match(source, /git status --short --untracked-files=all/);
+  assert.match(source, /git diff --shortstat/);
+  assert.match(source, /Recommend waiting only when the review is clearly tiny, roughly 1-2 files total/i);
+  assert.match(source, /In every other case, including unclear size, recommend background/i);
+  assert.match(source, /does not support custom focus text/i);
+  assert.match(source, /run_in_background:\s*true/);
+  assert.match(source, /Do not call `BashOutput`/);
+});
+
+test("adversarial review command uses AskUserQuestion and background Bash while staying review-only", () => {
+  const source = read("commands/adversarial-review.md");
+
+  assert.match(source, /disable-model-invocation:\s*true/);
+  assert.match(source, /AskUserQuestion/);
+  assert.match(source, /\bBash\(/);
+  assert.match(source, /review-only/i);
+  assert.match(source, /Do not fix issues/i);
+  assert.match(source, /return the engine output verbatim to the user/i);
+  assert.match(source, /adversarial-review "\$ARGUMENTS"/);
+  assert.match(source, /--engine <codex\|gemini\|droid>/);
+  assert.match(source, /\[focus \.\.\.\]/);
+  assert.match(source, /uses the same review target selection as `\/cc:review`/i);
+  assert.match(source, /does not support `--scope staged` or `--scope unstaged`/i);
+  assert.match(source, /run_in_background:\s*true/);
+  assert.match(source, /Do not call `BashOutput`/);
+});
+
+test("commands keep the unified /cc surface", () => {
   const rescue = read("commands/rescue.md");
   const setup = read("commands/setup.md");
+  const status = read("commands/status.md");
   const pluginManifest = read(".claude-plugin/plugin.json");
 
-  assert.match(review, /--engine <codex\|gemini\|droid>/);
-  assert.match(review, /--model <id>/);
-  assert.match(review, /--effort none\|minimal\|low\|medium\|high\|xhigh/);
-  assert.match(review, /cli-companion\.mjs" review/);
-  assert.match(adversarialReview, /--engine <codex\|gemini\|droid>/);
-  assert.match(adversarialReview, /--model <id>/);
-  assert.match(adversarialReview, /--effort none\|minimal\|low\|medium\|high\|xhigh/);
-  assert.match(adversarialReview, /cli-companion\.mjs" adversarial-review/);
   assert.match(rescue, /--engine <codex\|gemini\|droid>/);
   assert.match(rescue, /--model <id>/);
-  assert.match(rescue, /cli-companion\.mjs" task/);
-  assert.match(setup, /--engine <codex\|gemini\|droid>/);
-  assert.match(setup, /--model <id>/);
-  assert.match(setup, /--effort none\|minimal\|low\|medium\|high\|xhigh/);
-  assert.match(setup, /--all/);
+  assert.match(rescue, /task-resume-candidate --json/);
+  assert.match(rescue, /Continue current engine thread/);
+  assert.match(rescue, /Start a new engine thread/);
+  assert.match(rescue, /default to foreground/i);
+  assert.match(setup, /setup --json \$ARGUMENTS/);
+  assert.match(setup, /npm install -g @openai\/codex/);
+  assert.match(setup, /!codex login/);
+  assert.match(status, /\[--timeout-ms <ms>\]/);
+  assert.match(status, /single Markdown table/i);
   assert.match(pluginManifest, /"name": "cc"/);
 });
 
@@ -45,10 +79,14 @@ test("hooks wire Claude lifecycle events", () => {
   assert.match(hooks, /stop-review-gate-hook\.mjs/);
 });
 
-test("rescue agent is a thin forwarding wrapper", () => {
+test("rescue agent remains a thin forwarding wrapper with engine-aware routing hints", () => {
   const agent = read("agents/cc-rescue.md");
-  assert.match(agent, /thin forwarder/i);
+
+  assert.match(agent, /thin forwarding wrapper/i);
+  assert.match(agent, /Use exactly one `Bash` call/i);
+  assert.match(agent, /prefer foreground for a small, clearly bounded rescue request/i);
+  assert.match(agent, /prefer background execution/i);
   assert.match(agent, /Do not inspect the repository/i);
-  assert.match(agent, /Return the command stdout exactly as-is/i);
-  assert.match(agent, /cli-companion\.mjs" task "\$ARGUMENTS"/);
+  assert.match(agent, /Do not call `review`, `adversarial-review`, `status`, `result`, or `cancel`/i);
+  assert.match(agent, /Return the stdout of the `cli-companion` command exactly as-is/i);
 });

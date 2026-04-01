@@ -355,19 +355,61 @@ async function main() {
 
   const prompt = getFlag(args, "--prompt") || getFlag(args, "-p") || "";
   const resumeValue = getFlag(args, "--resume") || getFlag(args, "-r");
+  const model = getFlag(args, "--model") || getFlag(args, "-m") || null;
   const delayMs = Number(process.env.FAKE_ENGINE_DELAY_MS || "0");
   if (delayMs > 0) {
     await sleep(delayMs);
   }
 
+  if (process.env.FAKE_GEMINI_ERROR_MESSAGE) {
+    const failureModel = process.env.FAKE_GEMINI_ERROR_MODEL || model || "gemini-3.1-pro-preview";
+    process.stdout.write(JSON.stringify({
+      session_id: resumeValue || "gemini-session-123",
+      error: {
+        type: "Error",
+        message: process.env.FAKE_GEMINI_ERROR_MESSAGE,
+        code: Number(process.env.FAKE_GEMINI_ERROR_CODE || "1"),
+        reason: process.env.FAKE_GEMINI_ERROR_REASON || "MODEL_CAPACITY_EXHAUSTED",
+        model: failureModel
+      }
+    }) + "\\n");
+    process.exit(Number(process.env.FAKE_GEMINI_ERROR_EXIT_CODE || "1"));
+  }
+
   let response = "Gemini completed task.";
   if (prompt.includes("Return only valid JSON")) {
-    response = JSON.stringify({
-      verdict: "approve",
-      summary: "Gemini review completed.",
-      findings: [],
-      next_steps: []
-    });
+    if (process.env.FAKE_GEMINI_FENCED_REVIEW === "1") {
+      const fence = String.fromCharCode(96).repeat(3);
+      response = [
+        fence + "json",
+        JSON.stringify(
+          {
+            verdict: "approved",
+            findings: [
+              {
+                range: {
+                  start_line: 2,
+                  end_line: 4,
+                  file: "src/app.js"
+                },
+                severity: "info",
+                message: "Guarding empty arrays avoids an undefined access."
+              }
+            ]
+          },
+          null,
+          2
+        ),
+        fence
+      ].join("\\n");
+    } else {
+      response = JSON.stringify({
+        verdict: "approve",
+        summary: "Gemini review completed.",
+        findings: [],
+        next_steps: []
+      });
+    }
   } else if (prompt.includes("Run a stop-gate review of the previous Claude turn")) {
     response = process.env.FAKE_STOP_GATE_DECISION === "BLOCK"
       ? "BLOCK: A blocking issue was found in the previous turn."
@@ -430,26 +472,47 @@ async function main() {
   const sessionId = getFlag(args, "--session-id", "-s") || "droid-session-123";
   const prompt = args.at(-1) || "";
   const delayMs = Number(process.env.FAKE_ENGINE_DELAY_MS || "0");
+  const emitInitBeforeDelay = process.env.FAKE_DROID_INIT_BEFORE_DELAY === "1" && outputFormat === "stream-json";
+  if (emitInitBeforeDelay) {
+    process.stdout.write(JSON.stringify({ type: "system", subtype: "init", session_id: sessionId }) + "\\n");
+  }
   if (delayMs > 0) {
     await sleep(delayMs);
   }
 
   let response = "Droid completed task.";
   if (prompt.includes("Return only valid JSON")) {
-    response = JSON.stringify({
-      verdict: "needs-attention",
-      summary: "Droid review found one issue.",
-      findings: [
-        {
-          severity: "medium",
-          title: "Missing guard",
-          body: "Add an empty-state guard.",
-          file: "src/app.js",
-          recommendation: "Check for missing data before indexing."
-        }
-      ],
-      next_steps: ["Add an empty-state test."]
-    });
+    response = JSON.stringify(
+      process.env.FAKE_DROID_DECISION_ONLY === "1"
+        ? {
+            decision: "needs-attention",
+            summary: "Droid decision-mode review found one issue.",
+            findings: [
+              {
+                severity: "medium",
+                title: "Missing guard",
+                body: "Add an empty-state guard.",
+                file: "src/app.js",
+                recommendation: "Check for missing data before indexing."
+              }
+            ],
+            next_steps: ["Add an empty-state test."]
+          }
+        : {
+            verdict: "needs-attention",
+            summary: "Droid review found one issue.",
+            findings: [
+              {
+                severity: "medium",
+                title: "Missing guard",
+                body: "Add an empty-state guard.",
+                file: "src/app.js",
+                recommendation: "Check for missing data before indexing."
+              }
+            ],
+            next_steps: ["Add an empty-state test."]
+          }
+    );
   } else if (prompt.includes("Run a stop-gate review of the previous Claude turn")) {
     response = process.env.FAKE_STOP_GATE_DECISION === "BLOCK"
       ? "BLOCK: A blocking issue was found in the previous turn."
@@ -459,7 +522,9 @@ async function main() {
   }
 
   if (outputFormat === "stream-json") {
-    process.stdout.write(JSON.stringify({ type: "system", subtype: "init", session_id: sessionId }) + "\\n");
+    if (!emitInitBeforeDelay) {
+      process.stdout.write(JSON.stringify({ type: "system", subtype: "init", session_id: sessionId }) + "\\n");
+    }
     process.stdout.write(JSON.stringify({ type: "completion", finalText: response, session_id: sessionId }) + "\\n");
     return;
   }

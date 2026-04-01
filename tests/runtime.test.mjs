@@ -1,11 +1,14 @@
 import fs from "node:fs";
 import path from "node:path";
+import process from "node:process";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
 
 import { installFakeEngines } from "./fake-engine-fixture.mjs";
 import { initGitRepo, makeTempDir, run, waitFor } from "./helpers.mjs";
+import { resolveStateDir, setConfig } from "../plugins/cli-cc/scripts/lib/state.mjs";
+import { SESSION_ID_ENV } from "../plugins/cli-cc/scripts/lib/tracked-jobs.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const SCRIPT = path.join(ROOT, "plugins", "cli-cc", "scripts", "cli-companion.mjs");
@@ -98,6 +101,32 @@ test("setup persists codex defaults and later tasks inherit them", () => {
   assert.equal(turnStart?.payload?.effort, "medium");
 });
 
+test("all engines pass model ids through exactly as written", () => {
+  const binDir = makeTempDir();
+  const dataDir = makeTempDir();
+  const fixtures = installFakeEngines(binDir);
+  const repoDir = makeRepo();
+
+  const codexTask = run(process.execPath, [SCRIPT, "task", "--engine", "codex", "--model", "spark", "fix", "it"], {
+    cwd: repoDir,
+    env: envFor(binDir, dataDir)
+  });
+  assert.equal(codexTask.status, 0, codexTask.stderr);
+
+  const codexState = readJson(fixtures.codexStatePath);
+  const codexTurn = lastValue(findEvents(codexState, "turn/start"));
+  assert.equal(codexTurn?.payload?.model, "spark");
+
+  const droidTask = run(process.execPath, [SCRIPT, "task", "--engine", "droid", "--model", "spark", "fix", "it"], {
+    cwd: repoDir,
+    env: envFor(binDir, dataDir)
+  });
+  assert.equal(droidTask.status, 0, droidTask.stderr);
+
+  const droidLog = readJsonLines(fixtures.droidLogPath);
+  assert.match(droidLog.at(-1).args.join(" "), /--model spark/);
+});
+
 test("setup persists gemini and droid defaults for later runs", () => {
   const binDir = makeTempDir();
   const dataDir = makeTempDir();
@@ -133,6 +162,93 @@ test("setup persists gemini and droid defaults for later runs", () => {
   const droidLog = readJsonLines(fixtures.droidLogPath);
   assert.match(droidLog[0].args.join(" "), /--model gpt-5\.4/);
   assert.match(droidLog[0].args.join(" "), /--reasoning-effort medium/);
+});
+
+test("gemini warns and ignores explicit effort values because its CLI exposes no reasoning-effort flag", () => {
+  const binDir = makeTempDir();
+  const dataDir = makeTempDir();
+  const fixtures = installFakeEngines(binDir);
+  const repoDir = makeRepo();
+
+  const setup = run(process.execPath, [SCRIPT, "setup", "--engine", "gemini", "--effort", "high"], {
+    cwd: repoDir,
+    env: envFor(binDir, dataDir)
+  });
+  assert.equal(setup.status, 0, setup.stderr);
+  assert.match(setup.stderr, /Gemini does not support `--effort`/);
+  assert.match(setup.stderr, /Ignoring it\./);
+  assert.match(setup.stdout, /gemini: model=none, effort=none/);
+
+  const task = run(process.execPath, [SCRIPT, "task", "--engine", "gemini", "--model", "gemini-2.5-pro", "--effort", "high", "fix", "it"], {
+    cwd: repoDir,
+    env: envFor(binDir, dataDir)
+  });
+  assert.equal(task.status, 0, task.stderr);
+  assert.match(task.stderr, /Gemini does not support `--effort`/);
+  assert.match(task.stderr, /Ignoring it\./);
+
+  const geminiLog = readJsonLines(fixtures.geminiLogPath);
+  assert.equal(geminiLog.length, 1);
+  assert.match(geminiLog[0].args.join(" "), /--model gemini-2\.5-pro/);
+  assert.doesNotMatch(geminiLog[0].args.join(" "), /effort|reasoning/);
+});
+
+test("gemini ignores stale stored effort defaults from older plugin state", () => {
+  const binDir = makeTempDir();
+  const dataDir = makeTempDir();
+  const fixtures = installFakeEngines(binDir);
+  const repoDir = makeRepo();
+  const previousDataDir = process.env.CLI_PLUGIN_CC_DATA_DIR;
+  process.env.CLI_PLUGIN_CC_DATA_DIR = dataDir;
+  try {
+    setConfig(repoDir, {
+      engineDefaults: {
+        gemini: {
+          model: "gemini-2.5-pro",
+          effort: "high"
+        }
+      }
+    });
+  } finally {
+    if (previousDataDir == null) {
+      delete process.env.CLI_PLUGIN_CC_DATA_DIR;
+    } else {
+      process.env.CLI_PLUGIN_CC_DATA_DIR = previousDataDir;
+    }
+  }
+
+  const setup = run(process.execPath, [SCRIPT, "setup", "--engine", "gemini"], {
+    cwd: repoDir,
+    env: envFor(binDir, dataDir)
+  });
+  assert.equal(setup.status, 0, setup.stderr);
+  assert.match(setup.stdout, /gemini: model=gemini-2\.5-pro, effort=ignored \(high\)/);
+
+  const task = run(process.execPath, [SCRIPT, "task", "--engine", "gemini", "fix", "it"], {
+    cwd: repoDir,
+    env: envFor(binDir, dataDir)
+  });
+  assert.equal(task.status, 0, task.stderr);
+
+  const geminiLog = readJsonLines(fixtures.geminiLogPath);
+  assert.match(geminiLog[0].args.join(" "), /--model gemini-2\.5-pro/);
+  assert.doesNotMatch(geminiLog[0].args.join(" "), /effort|reasoning/);
+});
+
+test("gemini does not inject a plugin-level default model when none is configured", () => {
+  const binDir = makeTempDir();
+  const dataDir = makeTempDir();
+  const fixtures = installFakeEngines(binDir);
+  const repoDir = makeRepo();
+
+  const result = run(process.execPath, [SCRIPT, "task", "--engine", "gemini", "fix", "it"], {
+    cwd: repoDir,
+    env: envFor(binDir, dataDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const geminiLog = readJsonLines(fixtures.geminiLogPath);
+  assert.doesNotMatch(geminiLog[0].args.join(" "), /--model /);
 });
 
 test("setup rejects engine defaults when used with --all", () => {
@@ -196,6 +312,22 @@ test("adversarial review uses structured codex app-server output and forwards mo
   assert.equal(turnStart?.payload?.hasOutputSchema, true);
 });
 
+test("review rejects custom focus text and points users at adversarial review", () => {
+  const binDir = makeTempDir();
+  const dataDir = makeTempDir();
+  installFakeEngines(binDir);
+  const repoDir = makeRepo();
+
+  const result = run(process.execPath, [SCRIPT, "review", "--engine", "codex", "focus", "on", "auth"], {
+    cwd: repoDir,
+    env: envFor(binDir, dataDir)
+  });
+
+  assert.equal(result.status > 0, true);
+  assert.match(result.stderr, /does not support custom focus text/i);
+  assert.match(result.stderr, /\/cc:adversarial-review --engine codex focus on auth/i);
+});
+
 test("gemini rescue forwards model selection and native resume", () => {
   const binDir = makeTempDir();
   const dataDir = makeTempDir();
@@ -224,6 +356,50 @@ test("gemini rescue forwards model selection and native resume", () => {
   assert.equal(secondLog.length, 2);
   assert.match(secondLog[1].args.join(" "), /--resume gemini-session-123/);
   assert.match(secondLog[1].args.join(" "), /--model gemini-2\.5-pro/);
+});
+
+test("gemini surfaces model failures with the model id and reason", () => {
+  const binDir = makeTempDir();
+  const dataDir = makeTempDir();
+  installFakeEngines(binDir);
+  const repoDir = makeRepo();
+
+  const result = run(process.execPath, [SCRIPT, "review", "--engine", "gemini"], {
+    cwd: repoDir,
+    env: {
+      ...envFor(binDir, dataDir),
+      FAKE_GEMINI_ERROR_MODEL: "gemini-3.1-pro-preview",
+      FAKE_GEMINI_ERROR_CODE: "429",
+      FAKE_GEMINI_ERROR_REASON: "MODEL_CAPACITY_EXHAUSTED",
+      FAKE_GEMINI_ERROR_MESSAGE: "No capacity available for model gemini-3.1-pro-preview on the server"
+    }
+  });
+
+  assert.equal(result.status, 1);
+  assert.match(result.stdout, /model=gemini-3\.1-pro-preview/);
+  assert.match(result.stdout, /code=429/);
+  assert.match(result.stdout, /reason=MODEL_CAPACITY_EXHAUSTED/);
+  assert.match(result.stdout, /No capacity available for model gemini-3\.1-pro-preview on the server/);
+});
+
+test("gemini review accepts fenced json payloads and normalizes range-based findings", () => {
+  const binDir = makeTempDir();
+  const dataDir = makeTempDir();
+  installFakeEngines(binDir);
+  const repoDir = makeRepo();
+
+  const result = run(process.execPath, [SCRIPT, "review", "--engine", "gemini"], {
+    cwd: repoDir,
+    env: {
+      ...envFor(binDir, dataDir),
+      FAKE_GEMINI_FENCED_REVIEW: "1"
+    }
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Verdict: approved/);
+  assert.match(result.stdout, /\[info\] Finding 1 \(src\/app\.js:2-4\)/);
+  assert.match(result.stdout, /Guarding empty arrays avoids an undefined access\./);
 });
 
 test("review can route to droid using stream-json and review effort", () => {
@@ -278,6 +454,59 @@ test("droid rescue forwards model, mapped effort, and native session resume", ()
   assert.equal(secondLog.length, 2);
   assert.match(secondLog[1].args.join(" "), /--session-id droid-session-123/);
   assert.match(secondLog[1].args.join(" "), /--reasoning-effort high/);
+});
+
+test("job records persist normalized engine capabilities and owner state", () => {
+  const binDir = makeTempDir();
+  const dataDir = makeTempDir();
+  installFakeEngines(binDir);
+  const repoDir = makeRepo();
+
+  const result = run(process.execPath, [SCRIPT, "task", "--engine", "droid", "fix", "it"], {
+    cwd: repoDir,
+    env: envFor(binDir, dataDir)
+  });
+  assert.equal(result.status, 0, result.stderr);
+
+  const previousDataDir = process.env.CLI_PLUGIN_CC_DATA_DIR;
+  process.env.CLI_PLUGIN_CC_DATA_DIR = dataDir;
+  const stateDir = resolveStateDir(repoDir);
+  if (previousDataDir == null) {
+    delete process.env.CLI_PLUGIN_CC_DATA_DIR;
+  } else {
+    process.env.CLI_PLUGIN_CC_DATA_DIR = previousDataDir;
+  }
+  const state = readJson(path.join(stateDir, "state.json"));
+  const latestJob = state.jobs[0];
+  assert.equal(latestJob.capabilities.resumeKind, "session");
+  assert.equal(latestJob.capabilities.streamingLevel, "basic");
+  assert.equal(latestJob.ownerState.state, "completed");
+  assert.equal(latestJob.ownerState.cancelStrategy, "process");
+  assert.equal(latestJob.ownerState.sessionRef, "droid-session-123");
+
+  const storedJob = readJson(path.join(stateDir, "jobs", `${latestJob.id}.json`));
+  assert.equal(storedJob.ownerState.sessionRef, "droid-session-123");
+  assert.equal(storedJob.result.capabilities.resumeKind, "session");
+});
+
+test("droid adversarial review accepts decision-shaped structured output", () => {
+  const binDir = makeTempDir();
+  const dataDir = makeTempDir();
+  installFakeEngines(binDir);
+  const repoDir = makeRepo();
+
+  const result = run(process.execPath, [SCRIPT, "adversarial-review", "--engine", "droid", "Find correctness regressions only"], {
+    cwd: repoDir,
+    env: {
+      ...envFor(binDir, dataDir),
+      FAKE_DROID_DECISION_ONLY: "1"
+    }
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /# Adversarial Review \(droid\)/);
+  assert.match(result.stdout, /Verdict: needs-attention/);
+  assert.match(result.stdout, /Droid decision-mode review found one issue\./);
 });
 
 test("invalid effort values are rejected before the engine starts", () => {
@@ -390,6 +619,13 @@ test("background rescue job supports status and result", async () => {
   assert.ok(match, start.stdout);
   const jobId = match[1];
 
+  const earlyResult = run(process.execPath, [SCRIPT, "result", jobId], {
+    cwd: repoDir,
+    env: envFor(binDir, dataDir)
+  });
+  assert.equal(earlyResult.status, 1);
+  assert.match(earlyResult.stderr, /is still (queued|running)/);
+
   await waitFor(() => {
     const status = run(process.execPath, [SCRIPT, "status"], {
       cwd: repoDir,
@@ -426,6 +662,268 @@ test("background rescue job supports status and result", async () => {
   assert.match(result.stdout, /Handled the requested task/);
   assert.match(result.stdout, /Session ID: thr_/);
   assert.match(result.stdout, /Resume: codex resume thr_/);
+});
+
+test("droid background status surfaces session id before completion when stream init arrives early", async () => {
+  const binDir = makeTempDir();
+  const dataDir = makeTempDir();
+  installFakeEngines(binDir);
+  const repoDir = makeRepo();
+
+  const start = run(process.execPath, [SCRIPT, "task", "--engine", "droid", "--background", "fix", "the", "bug"], {
+    cwd: repoDir,
+    env: {
+      ...envFor(binDir, dataDir),
+      FAKE_ENGINE_DELAY_MS: "2500",
+      FAKE_DROID_INIT_BEFORE_DELAY: "1"
+    }
+  });
+
+  assert.equal(start.status, 0, start.stderr);
+  const match = start.stdout.match(/Started (task-[^) ]+)/);
+  assert.ok(match, start.stdout);
+  const jobId = match[1];
+
+  await waitFor(() => {
+    const status = run(process.execPath, [SCRIPT, "status", jobId, "--json"], {
+      cwd: repoDir,
+      env: {
+        ...envFor(binDir, dataDir),
+        FAKE_ENGINE_DELAY_MS: "2500",
+        FAKE_DROID_INIT_BEFORE_DELAY: "1"
+      }
+    });
+    if (status.status !== 0) {
+      return false;
+    }
+    const parsed = JSON.parse(status.stdout);
+    return parsed.job.status === "running" && parsed.job.sessionRef === "droid-session-123";
+  }, 3000);
+
+  const runningStatus = run(process.execPath, [SCRIPT, "status", jobId], {
+    cwd: repoDir,
+    env: {
+      ...envFor(binDir, dataDir),
+      FAKE_ENGINE_DELAY_MS: "2500",
+      FAKE_DROID_INIT_BEFORE_DELAY: "1"
+    }
+  });
+  assert.equal(runningStatus.status, 0, runningStatus.stderr);
+  assert.match(runningStatus.stdout, /Session ID: droid-session-123/);
+
+  await waitFor(() => {
+    const status = run(process.execPath, [SCRIPT, "status", jobId, "--json"], {
+      cwd: repoDir,
+      env: {
+        ...envFor(binDir, dataDir),
+        FAKE_ENGINE_DELAY_MS: "2500",
+        FAKE_DROID_INIT_BEFORE_DELAY: "1"
+      }
+    });
+    return status.status === 0 && /"completed"/.test(status.stdout);
+  }, 4000);
+});
+
+test("task-resume-candidate returns the latest rescue thread for the current session and engine", () => {
+  const workspace = makeTempDir();
+  const stateDir = resolveStateDir(workspace);
+  const jobsDir = path.join(stateDir, "jobs");
+  fs.mkdirSync(jobsDir, { recursive: true });
+
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    `${JSON.stringify(
+      {
+        version: 1,
+        config: {
+          defaultEngine: "codex",
+          stopReviewGate: false,
+          stopReviewGateEngine: "codex",
+          engineDefaults: {}
+        },
+        jobs: [
+          {
+            id: "task-current",
+            engine: "codex",
+            status: "completed",
+            title: "rescue via codex",
+            jobClass: "task",
+            sessionId: "sess-current",
+            threadId: "thr_current",
+            summary: "Investigate the flaky test",
+            updatedAt: "2026-03-24T20:00:00.000Z"
+          },
+          {
+            id: "task-other-engine",
+            engine: "gemini",
+            status: "completed",
+            title: "rescue via gemini",
+            jobClass: "task",
+            sessionId: "sess-current",
+            sessionRef: "gemini-session-123",
+            summary: "Other engine",
+            updatedAt: "2026-03-24T20:05:00.000Z"
+          },
+          {
+            id: "task-other-session",
+            engine: "codex",
+            status: "completed",
+            title: "rescue via codex",
+            jobClass: "task",
+            sessionId: "sess-other",
+            threadId: "thr_other",
+            summary: "Old rescue run",
+            updatedAt: "2026-03-24T20:10:00.000Z"
+          }
+        ]
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+
+  const result = run(process.execPath, [SCRIPT, "task-resume-candidate", "--engine", "codex", "--json"], {
+    cwd: workspace,
+    env: {
+      ...process.env,
+      [SESSION_ID_ENV]: "sess-current"
+    }
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.available, true);
+  assert.equal(payload.engine, "codex");
+  assert.equal(payload.sessionId, "sess-current");
+  assert.equal(payload.candidate.id, "task-current");
+  assert.equal(payload.candidate.threadId, "thr_current");
+});
+
+test("status without a job id renders a compact table", () => {
+  const workspace = makeTempDir();
+  const stateDir = resolveStateDir(workspace);
+  const jobsDir = path.join(stateDir, "jobs");
+  fs.mkdirSync(jobsDir, { recursive: true });
+
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    `${JSON.stringify(
+      {
+        version: 1,
+        config: {
+          defaultEngine: "codex",
+          stopReviewGate: false,
+          stopReviewGateEngine: "codex",
+          engineDefaults: {}
+        },
+        jobs: [
+          {
+            id: "task-live",
+            engine: "codex",
+            kindLabel: "rescue",
+            status: "running",
+            title: "rescue via codex",
+            jobClass: "task",
+            phase: "running",
+            threadId: "thr_live",
+            summary: "Investigate flaky test",
+            createdAt: "2026-03-18T15:30:00.000Z",
+            updatedAt: "2026-03-18T15:30:03.000Z"
+          },
+          {
+            id: "review-done",
+            engine: "gemini",
+            kindLabel: "review",
+            status: "completed",
+            title: "review via gemini",
+            jobClass: "review",
+            sessionRef: "gemini-session-1",
+            summary: "Review main...HEAD",
+            createdAt: "2026-03-18T15:10:00.000Z",
+            startedAt: "2026-03-18T15:10:05.000Z",
+            completedAt: "2026-03-18T15:11:10.000Z",
+            updatedAt: "2026-03-18T15:11:10.000Z"
+          }
+        ]
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+
+  const result = run(process.execPath, [SCRIPT, "status"], {
+    cwd: workspace
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /\| Job \| Kind \| Engine \| Status \| Phase \| Time \| Session ID \| Summary \| Actions \|/);
+  assert.match(result.stdout, /\| task-live \| rescue \| codex \| running \| running \| .* \| thr_live \| Investigate flaky test \|/);
+  assert.match(result.stdout, /`\/cc:status task-live`<br>`\/cc:cancel task-live`/);
+  assert.match(result.stdout, /\| review-done \| review \| gemini \| completed \| done \| .* \| gemini-session-1 \| Review main\.\.\.HEAD \|/);
+  assert.doesNotMatch(result.stdout, /Live details:/);
+  assert.doesNotMatch(result.stdout, /Latest finished:/);
+});
+
+test("status --wait requires a job id", () => {
+  const workspace = makeTempDir();
+
+  const result = run(process.execPath, [SCRIPT, "status", "--wait"], {
+    cwd: workspace
+  });
+
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /status --wait.*requires a job id/i);
+});
+
+test("status --wait on a single job times out cleanly in json mode", () => {
+  const workspace = makeTempDir();
+  const stateDir = resolveStateDir(workspace);
+  const jobsDir = path.join(stateDir, "jobs");
+  fs.mkdirSync(jobsDir, { recursive: true });
+
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    `${JSON.stringify(
+      {
+        version: 1,
+        config: {
+          defaultEngine: "codex",
+          stopReviewGate: false,
+          stopReviewGateEngine: "codex",
+          engineDefaults: {}
+        },
+        jobs: [
+          {
+            id: "task-live",
+            engine: "codex",
+            kindLabel: "rescue",
+            status: "running",
+            title: "rescue via codex",
+            jobClass: "task",
+            summary: "Investigate flaky test",
+            createdAt: "2026-03-18T15:30:00.000Z",
+            startedAt: "2026-03-18T15:30:01.000Z",
+            updatedAt: "2026-03-18T15:30:02.000Z"
+          }
+        ]
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+
+  const result = run(process.execPath, [SCRIPT, "status", "task-live", "--wait", "--timeout-ms", "25", "--json"], {
+    cwd: workspace
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.job.id, "task-live");
+  assert.equal(payload.job.status, "running");
+  assert.equal(payload.waitTimedOut, true);
 });
 
 test("cancel marks a running job as cancelled", async () => {

@@ -104,6 +104,10 @@ function formatJobLine(job) {
   return parts.join(" | ");
 }
 
+function getEffectiveSessionId(job) {
+  return job?.threadId ?? job?.sessionRef ?? job?.ownerState?.threadId ?? job?.ownerState?.sessionRef ?? null;
+}
+
 function escapeMarkdownCell(value) {
   return String(value ?? "")
     .replace(/\|/g, "\\|")
@@ -115,10 +119,11 @@ function formatResumeCommand(job) {
   if (!job?.engine) {
     return null;
   }
-  if (job.engine === "codex" && job.threadId) {
-    return `codex resume ${job.threadId}`;
+  const sessionId = getEffectiveSessionId(job);
+  if (job.engine === "codex" && (job.threadId || job.ownerState?.threadId)) {
+    return `codex resume ${job.threadId ?? job.ownerState?.threadId}`;
   }
-  if ((job.sessionRef || job.threadId) && job.jobClass === "task") {
+  if (sessionId && job.jobClass === "task") {
     return `/cc:rescue --engine ${job.engine} --resume`;
   }
   return null;
@@ -134,9 +139,19 @@ function appendActiveJobsTable(lines, jobs) {
       actions.push(`/cc:cancel ${job.id}`);
     }
     lines.push(
-      `| ${escapeMarkdownCell(job.id)} | ${escapeMarkdownCell(job.kindLabel)} | ${escapeMarkdownCell(job.engine ?? "")} | ${escapeMarkdownCell(job.status)} | ${escapeMarkdownCell(job.phase ?? "")} | ${escapeMarkdownCell(job.elapsed ?? "")} | ${escapeMarkdownCell(job.threadId ?? job.sessionRef ?? "")} | ${escapeMarkdownCell(job.summary ?? "")} | ${actions.map((action) => `\`${action}\``).join("<br>")} |`
+      `| ${escapeMarkdownCell(job.id)} | ${escapeMarkdownCell(job.kindLabel)} | ${escapeMarkdownCell(job.engine ?? "")} | ${escapeMarkdownCell(job.status)} | ${escapeMarkdownCell(job.phase ?? "")} | ${escapeMarkdownCell(job.elapsed ?? "")} | ${escapeMarkdownCell(getEffectiveSessionId(job) ?? "")} | ${escapeMarkdownCell(job.summary ?? "")} | ${actions.map((action) => `\`${action}\``).join("<br>")} |`
     );
   }
+}
+
+function buildStatusActions(job) {
+  const actions = [`/cc:status ${job.id}`];
+  if (job.status === "queued" || job.status === "running") {
+    actions.push(`/cc:cancel ${job.id}`);
+    return actions;
+  }
+  actions.push(`/cc:result ${job.id}`);
+  return actions;
 }
 
 function pushJobDetails(lines, job, options = {}) {
@@ -153,8 +168,8 @@ function pushJobDetails(lines, job, options = {}) {
   if (options.showDuration && job.duration) {
     lines.push(`  Duration: ${job.duration}`);
   }
-  if (job.threadId || job.sessionRef) {
-    lines.push(`  Session ID: ${job.threadId ?? job.sessionRef}`);
+  if (getEffectiveSessionId(job)) {
+    lines.push(`  Session ID: ${getEffectiveSessionId(job)}`);
   }
   const resumeCommand = formatResumeCommand(job);
   if (resumeCommand) {
@@ -202,10 +217,23 @@ function appendSession(lines, result) {
   }
 }
 
+function formatConfiguredEffort(engine, defaults = {}) {
+  const storedEffort = defaults.effort ?? null;
+  if (engine?.capabilities?.effortControl === "unsupported") {
+    return storedEffort ? `ignored (${storedEffort})` : "none";
+  }
+  return storedEffort ?? "none";
+}
+
 export function renderSetup(report) {
   const lines = [
     "# cli-plugin-cc setup",
     "",
+    `Status: ${report.ready ? "ready" : "needs attention"}`,
+    "",
+    "Checks:",
+    `- node: ${report.node?.detail ?? "unknown"}`,
+    `- npm: ${report.npm?.detail ?? "unknown"}`,
     `Codex runtime: ${report.sessionRuntime.label}`,
     `Review gate: ${report.config.stopReviewGate ? "enabled" : "disabled"} (${report.config.stopReviewGateEngine})`,
     "",
@@ -228,8 +256,14 @@ export function renderSetup(report) {
   for (const engine of report.engines) {
     const defaults = report.config.engineDefaults?.[engine.id] ?? {};
     const model = defaults.model ?? "none";
-    const effort = defaults.effort ?? "none";
+    const effort = formatConfiguredEffort(engine, defaults);
     lines.push(`- ${engine.id}: model=${model}, effort=${effort}`);
+  }
+  if (Array.isArray(report.nextSteps) && report.nextSteps.length > 0) {
+    lines.push("", "Next steps:");
+    for (const step of report.nextSteps) {
+      lines.push(`- ${step}`);
+    }
   }
   return `${lines.join("\n").trimEnd()}\n`;
 }
@@ -361,38 +395,24 @@ export function renderStatusReport(report) {
     ""
   ];
 
-  if (report.running.length > 0) {
-    appendActiveJobsTable(lines, report.running);
-    lines.push("", "Live details:");
-    for (const job of report.running) {
-      pushJobDetails(lines, job, {
-        showElapsed: true,
-        showLog: true
-      });
-    }
-    lines.push("");
-  }
-
+  const jobs = [...report.running];
   if (report.latestFinished) {
-    lines.push("Latest finished:");
-    pushJobDetails(lines, report.latestFinished, {
-      showDuration: true,
-      showLog: report.latestFinished.status === "failed"
-    });
-    lines.push("");
+    jobs.push(report.latestFinished);
   }
+  jobs.push(...report.recent);
 
-  if (report.recent.length > 0) {
-    lines.push("Recent jobs:");
-    for (const job of report.recent) {
-      pushJobDetails(lines, job, {
-        showDuration: true,
-        showLog: job.status === "failed"
-      });
+  if (jobs.length === 0) {
+    lines.push("No jobs recorded yet.", "");
+  } else {
+    lines.push("| Job | Kind | Engine | Status | Phase | Time | Session ID | Summary | Actions |");
+    lines.push("| --- | --- | --- | --- | --- | --- | --- | --- | --- |");
+    for (const job of jobs) {
+      const timeLabel = job.status === "queued" || job.status === "running" ? job.elapsed ?? "" : job.duration ?? "";
+      lines.push(
+        `| ${escapeMarkdownCell(job.id)} | ${escapeMarkdownCell(job.kindLabel)} | ${escapeMarkdownCell(job.engine ?? "")} | ${escapeMarkdownCell(job.status)} | ${escapeMarkdownCell(job.phase ?? "")} | ${escapeMarkdownCell(timeLabel)} | ${escapeMarkdownCell(getEffectiveSessionId(job) ?? "")} | ${escapeMarkdownCell(job.summary ?? "")} | ${buildStatusActions(job).map((action) => `\`${action}\``).join("<br>")} |`
+      );
     }
     lines.push("");
-  } else if (report.running.length === 0 && !report.latestFinished) {
-    lines.push("No jobs recorded yet.", "");
   }
 
   if (report.needsReview) {
@@ -417,8 +437,8 @@ export function renderJobStatusReport(job) {
 }
 
 export function renderStoredJobResult(job, storedJob) {
-  const threadId = storedJob?.threadId ?? job.threadId ?? null;
-  const sessionRef = storedJob?.sessionRef ?? job.sessionRef ?? null;
+  const threadId = storedJob?.threadId ?? job.threadId ?? job.ownerState?.threadId ?? null;
+  const sessionRef = storedJob?.sessionRef ?? job.sessionRef ?? job.ownerState?.sessionRef ?? null;
   const resumeCommand = formatResumeCommand({
     ...job,
     threadId,

@@ -1,6 +1,7 @@
 import { codexAdapter } from "./codex.mjs";
 import { droidAdapter } from "./droid.mjs";
 import { geminiAdapter } from "./gemini.mjs";
+import { buildSessionOwnerState, engineEventToProgress, getEngineCapabilities } from "./runtime.mjs";
 
 export const ENGINE_ADAPTERS = {
   codex: codexAdapter,
@@ -29,6 +30,16 @@ export function getEngineInfo(engineId) {
   return getEngineAdapter(engineId).info;
 }
 
+export function getEngineRuntimeCapabilities(engineId) {
+  return getEngineCapabilities(normalizeEngine(engineId));
+}
+
+export function createEngineOwnerState(engineId, state = "queued", overrides = {}) {
+  return buildSessionOwnerState(normalizeEngine(engineId), state, overrides);
+}
+
+export { engineEventToProgress };
+
 export function getResumeMode(engineId) {
   return getEngineInfo(engineId).resume;
 }
@@ -45,17 +56,20 @@ export async function interruptEngineJob(cwd, job) {
   return getEngineAdapter(job?.engine).interrupt(cwd, job);
 }
 
-export async function runReview(args) {
+export function startEngineRun(args) {
   const adapter = getEngineAdapter(args.engine);
-  return adapter.review(args);
+  if (typeof adapter.startRun !== "function") {
+    throw new Error(`Engine ${args.engine} does not implement startRun().`);
+  }
+  return adapter.startRun(args);
+}
+
+export async function runReview(args) {
+  return startEngineRun(args).result();
 }
 
 export async function runTask(args) {
-  const adapter = getEngineAdapter(args.engine);
-  if (args.resume && typeof adapter.resume === "function") {
-    return adapter.resume(args);
-  }
-  return adapter.task(args);
+  return startEngineRun(args).result();
 }
 
 export async function findResumeCandidate(engine, cwd) {
