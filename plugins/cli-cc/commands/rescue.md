@@ -1,6 +1,6 @@
 ---
-description: Delegate investigation or implementation work to Codex, Gemini, or Droid from Claude Code.
-argument-hint: "[--engine <codex|gemini|droid>] [--background|--wait] [--resume|--fresh] [--model <id>] [--effort <none|minimal|low|medium|high|xhigh>] [--permission <read-only|edit|dev|full|unsafe>] [what the engine should investigate, solve, or continue]"
+description: Delegate investigation or implementation work to Codex, Gemini, or Droid from Claude Code, with optional auto routing.
+argument-hint: "[--engine <codex|gemini|droid|auto>] [--background|--wait] [--resume|--fresh] [--model <id>] [--effort <none|minimal|low|medium|high|xhigh>] [--permission <read-only|edit|dev|full|unsafe>] [what the engine should investigate, solve, or continue]"
 allowed-tools: Bash, AskUserQuestion
 ---
 
@@ -16,6 +16,8 @@ Execution mode:
 - If neither flag is present, default to foreground.
 - `--background` and `--wait` are Claude-side execution controls. Do not treat them as task text.
 - `--model`, `--effort`, and `--permission` are runtime-selection flags. Preserve them for the forwarded `task` call, but do not treat them as task text.
+- `--engine auto` is valid and lets the runtime select the best ready engine from the current `/cc:policy`.
+- If the user omits `--engine` and `/cc:policy --prefer-auto` is enabled for this repo, the runtime may still auto-route the task.
 - If the request includes `--resume`, do not ask whether to continue.
 - If the request includes `--fresh`, do not ask whether to continue.
 - Otherwise, before starting the engine, check for a resumable task thread from this Claude session by running:

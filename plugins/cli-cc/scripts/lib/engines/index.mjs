@@ -9,8 +9,16 @@ export const ENGINE_ADAPTERS = {
   droid: droidAdapter
 };
 
+export function listSupportedEngineIds() {
+  return Object.keys(ENGINE_ADAPTERS);
+}
+
 export function listSupportedEngines() {
   return Object.values(ENGINE_ADAPTERS).map((adapter) => adapter.info);
+}
+
+export function isSupportedEngine(engineId) {
+  return listSupportedEngineIds().includes(engineId);
 }
 
 export function normalizeEngine(engineId) {

@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { defaultAutoRoutingConfig, normalizeAutoRoutingConfig } from "./policy.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 import { terminateProcessTree } from "./process.mjs";
 
@@ -24,7 +25,8 @@ function defaultState() {
       defaultEngine: "codex",
       stopReviewGate: false,
       stopReviewGateEngine: "codex",
-      engineDefaults: {}
+      engineDefaults: {},
+      autoRouting: defaultAutoRoutingConfig()
     },
     jobs: []
   };
@@ -53,7 +55,8 @@ function normalizeConfig(config) {
   return {
     ...defaultState().config,
     ...(config ?? {}),
-    engineDefaults: normalizeEngineDefaults(config?.engineDefaults)
+    engineDefaults: normalizeEngineDefaults(config?.engineDefaults),
+    autoRouting: normalizeAutoRoutingConfig(config?.autoRouting)
   };
 }
 

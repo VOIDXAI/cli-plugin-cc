@@ -33,6 +33,7 @@ import {
   resolveCancelableJob,
   resolveResultJob
 } from "./lib/job-control.mjs";
+import { buildWorkspaceMemorySnapshot } from "./lib/memory.mjs";
 import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
 import {
   generateJobId,
@@ -46,11 +47,14 @@ import {
 import {
   renderCancelReport,
   renderJobStatusReport,
+  renderMatrixReviewResult,
+  renderPolicyReport,
   renderReview,
   renderSetup,
   renderStatusReport,
   renderStoredJobResult,
-  renderTaskResult
+  renderTaskResult,
+  renderWorkspaceMemory
 } from "./lib/render.mjs";
 import {
   appendLogBlock,
@@ -67,6 +71,15 @@ import {
   resolveConfiguredTaskPermission,
   formatTaskPermissionSummary
 } from "./lib/permissions.mjs";
+import {
+  AUTO_ENGINE_ID,
+  buildPolicyReport,
+  parseEngineList,
+  parsePolicyPreset,
+  resolveExecutionEngine,
+  resolveMatrixReviewEngines,
+  shouldUseAutoRouting
+} from "./lib/policy.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
 const SCRIPT_PATH = fileURLToPath(import.meta.url);
@@ -187,6 +200,55 @@ function resolveEngine(options, workspaceRoot) {
   return normalizeEngine(options.engine || getConfig(workspaceRoot).defaultEngine);
 }
 
+function normalizeRequestedEngineInput(engine, { allowAuto = false } = {}) {
+  const normalized = typeof engine === "string" ? engine.trim().toLowerCase() : "";
+  if (!normalized) {
+    return normalizeEngine();
+  }
+  if (allowAuto && normalized === AUTO_ENGINE_ID) {
+    return AUTO_ENGINE_ID;
+  }
+  return normalizeEngine(normalized);
+}
+
+function resolveRequestedEngine(options, workspaceRoot, { allowAuto = false } = {}) {
+  const config = getConfig(workspaceRoot);
+  if (allowAuto && shouldUseAutoRouting(options, config)) {
+    return AUTO_ENGINE_ID;
+  }
+  return normalizeRequestedEngineInput(options.engine || config.defaultEngine, { allowAuto });
+}
+
+async function resolveEngineSelection({
+  requestedEngine,
+  workspaceRoot,
+  jobClass,
+  readOnly = false,
+  scope = null,
+  baseRef = null
+}) {
+  return resolveExecutionEngine({
+    requestedEngine,
+    cwd: workspaceRoot,
+    jobClass,
+    readOnly,
+    scope,
+    baseRef,
+    config: getConfig(workspaceRoot)
+  });
+}
+
+function applyEngineSelectionMetadata(extra = {}, selection = {}, engine = null) {
+  return {
+    ...extra,
+    requestedEngine: selection.requestedEngine ?? engine ?? extra.requestedEngine ?? null,
+    policyId: selection.policyId ?? null,
+    selectionReason: selection.selectionReason ?? null,
+    fallbackChain: Array.isArray(selection.fallbackChain) ? selection.fallbackChain : [],
+    routeContext: selection.routeContext ?? null
+  };
+}
+
 function getEngineDefaults(config, engine) {
   return config?.engineDefaults?.[engine] ?? {};
 }
@@ -260,11 +322,16 @@ function createBaseJob({ workspaceRoot, cwd, engine, jobClass, title, kindLabel 
     pid: null,
     capabilities,
     ownerState: createEngineOwnerState(engine, "queued"),
+    requestedEngine: extra.requestedEngine ?? engine,
+    policyId: extra.policyId ?? null,
+    selectionReason: extra.selectionReason ?? null,
+    fallbackChain: extra.fallbackChain ?? [],
+    routeContext: extra.routeContext ?? null,
     ...extra
   });
 }
 
-function createReviewJob({ workspaceRoot, cwd, engine, kind, options, focusText }) {
+function createReviewJob({ workspaceRoot, cwd, engine, kind, options, focusText, selection = {} }) {
   return createBaseJob({
     workspaceRoot,
     cwd,
@@ -277,12 +344,13 @@ function createReviewJob({ workspaceRoot, cwd, engine, kind, options, focusText 
       baseRef: options.base ?? null,
       focusText: focusText || null,
       model: normalizeRequestedModel(engine, options.model),
-      effort: normalizeReasoningEffort(options.effort)
+      effort: normalizeReasoningEffort(options.effort),
+      ...applyEngineSelectionMetadata({}, selection, engine)
     }
   });
 }
 
-function createTaskJob({ workspaceRoot, cwd, engine, options, prompt, readOnly = false, jobClass = "task" }) {
+function createTaskJob({ workspaceRoot, cwd, engine, options, prompt, readOnly = false, jobClass = "task", selection = {} }) {
   const semanticPermission = !readOnly && jobClass === "task" ? normalizeTaskPermission(options.permission) : null;
   const permissionSummary =
     !readOnly && jobClass === "task"
@@ -310,7 +378,8 @@ function createTaskJob({ workspaceRoot, cwd, engine, options, prompt, readOnly =
       permission: semanticPermission,
       permissionSource: !readOnly && jobClass === "task" ? options.permissionSource ?? "legacy" : null,
       permissionNative: !readOnly && jobClass === "task" ? options.permissionNative ?? null : null,
-      permissionSummary
+      permissionSummary,
+      ...applyEngineSelectionMetadata({}, selection, engine)
     }
   });
 }
@@ -325,6 +394,7 @@ function createWorkflowStepRecord(step, index) {
     id: step.id,
     title: step.title,
     engine: step.engine,
+    requestedEngine: step.engine,
     assignmentSource: step.assignmentSource,
     kind: step.kind,
     input: step.input ?? null,
@@ -343,7 +413,11 @@ function createWorkflowStepRecord(step, index) {
     permission: null,
     permissionNative: null,
     permissionSource: null,
-    ownerState: createEngineOwnerState(step.engine, "queued"),
+    policyId: null,
+    selectionReason: null,
+    fallbackChain: [],
+    routeContext: null,
+    ownerState: createEngineOwnerState(step.engine === AUTO_ENGINE_ID ? "multi" : step.engine, "queued"),
     rendered: null,
     output: null,
     result: null
@@ -366,6 +440,58 @@ function createOrchestrateJob({ workspaceRoot, cwd, plan }) {
       steps: plan.steps.map((step, index) => createWorkflowStepRecord(step, index)),
       summary: `Queued ${plan.steps.length}-step workflow.`,
       lastCompletedStepIndex: null
+    }
+  });
+}
+
+function createMatrixReviewerRecord(engine, index) {
+  return {
+    index: index + 1,
+    id: `reviewer-${engine}`,
+    title: `adversarial-review via ${engine}`,
+    engine,
+    requestedEngine: engine,
+    status: "pending",
+    phase: "pending",
+    verdict: null,
+    summary: null,
+    sessionRef: null,
+    threadId: null,
+    turnId: null,
+    startedAt: null,
+    completedAt: null,
+    ownerState: createEngineOwnerState(engine, "queued"),
+    rendered: null,
+    result: null
+  };
+}
+
+function createMatrixReviewJob({ workspaceRoot, cwd, engines, options, focusText, selection }) {
+  return createBaseJob({
+    workspaceRoot,
+    cwd,
+    engine: "multi",
+    jobClass: "matrix-review",
+    kindLabel: "matrix-review",
+    title: `matrix review via ${engines.join(", ")}`,
+    extra: {
+      reviewKind: "adversarial-review",
+      scope: options.scope || "auto",
+      baseRef: options.base ?? null,
+      focusText: focusText || null,
+      reviewers: engines.map((engine, index) => createMatrixReviewerRecord(engine, index)),
+      targetLabel: null,
+      consensus: null,
+      summary: `Queued ${engines.length}-engine matrix review.`,
+      ...applyEngineSelectionMetadata(
+        {
+          requestedEngine: Array.isArray(selection.requestedEngines)
+            ? selection.requestedEngines.join(",")
+            : engines.join(",")
+        },
+        selection,
+        "multi"
+      )
     }
   });
 }
@@ -409,6 +535,19 @@ function buildWorkflowInterpolationContext(workflowJob) {
 async function assertWorkflowEnginesReady(plan, cwd) {
   const engines = [...new Set(plan.steps.map((step) => step.engine))];
   for (const engine of engines) {
+    if (engine === AUTO_ENGINE_ID) {
+      const firstAutoStep = plan.steps.find((step) => step.engine === AUTO_ENGINE_ID);
+      await resolveEngineSelection({
+        requestedEngine: AUTO_ENGINE_ID,
+        workspaceRoot: cwd,
+        jobClass: firstAutoStep?.kind ?? "task",
+        readOnly: false,
+        scope: firstAutoStep?.options?.scope ?? null,
+        baseRef: firstAutoStep?.options?.base ?? null
+      });
+      continue;
+    }
+
     const detected = await detectEngine(engine, cwd);
     if (!detected.available) {
       throw new Error(`${detected.label} is not installed or not on PATH. Run /cc:setup --engine ${engine} first.`);
@@ -421,14 +560,14 @@ async function assertWorkflowEnginesReady(plan, cwd) {
   }
 }
 
-function buildWorkflowStepExecutionJob({ workflowJob, step, resolvedInput, resolvedOptions }) {
+function buildWorkflowStepExecutionJob({ workflowJob, step, resolvedInput, resolvedOptions, engine, selection = {} }) {
   if (step.kind === "task") {
     const semanticPermission = normalizeTaskPermission(resolvedOptions.permission);
     return {
       id: `${workflowJob.id}:${step.id}`,
       workspaceRoot: workflowJob.workspaceRoot,
       cwd: workflowJob.workspaceRoot,
-      engine: step.engine,
+      engine,
       jobClass: "task",
       kindLabel: "rescue",
       title: step.title,
@@ -436,7 +575,7 @@ function buildWorkflowStepExecutionJob({ workflowJob, step, resolvedInput, resol
       readOnly: false,
       write: semanticPermission !== "read-only",
       resume: false,
-      model: normalizeRequestedModel(step.engine, resolvedOptions.model),
+      model: normalizeRequestedModel(engine, resolvedOptions.model),
       effort: normalizeReasoningEffort(resolvedOptions.effort),
       requestedPermission: normalizeTaskPermission(resolvedOptions.requestedPermission),
       permission: semanticPermission,
@@ -446,8 +585,9 @@ function buildWorkflowStepExecutionJob({ workflowJob, step, resolvedInput, resol
         permission: semanticPermission,
         nativeLabel: resolvedOptions.permissionNative
       }),
-      capabilities: getEngineRuntimeCapabilities(step.engine),
-      ownerState: createEngineOwnerState(step.engine, "queued")
+      capabilities: getEngineRuntimeCapabilities(engine),
+      ownerState: createEngineOwnerState(engine, "queued"),
+      ...applyEngineSelectionMetadata({}, selection, engine)
     };
   }
 
@@ -455,17 +595,18 @@ function buildWorkflowStepExecutionJob({ workflowJob, step, resolvedInput, resol
     id: `${workflowJob.id}:${step.id}`,
     workspaceRoot: workflowJob.workspaceRoot,
     cwd: workflowJob.workspaceRoot,
-    engine: step.engine,
+    engine,
     jobClass: step.kind,
     kindLabel: step.kind,
     title: step.title,
     scope: resolvedOptions.scope || "auto",
     baseRef: resolvedOptions.base ?? null,
     focusText: step.kind === "adversarial-review" ? resolvedInput ?? null : null,
-    model: normalizeRequestedModel(step.engine, resolvedOptions.model),
+    model: normalizeRequestedModel(engine, resolvedOptions.model),
     effort: normalizeReasoningEffort(resolvedOptions.effort),
-    capabilities: getEngineRuntimeCapabilities(step.engine),
-    ownerState: createEngineOwnerState(step.engine, "queued")
+    capabilities: getEngineRuntimeCapabilities(engine),
+    ownerState: createEngineOwnerState(engine, "queued"),
+    ...applyEngineSelectionMetadata({}, selection, engine)
   };
 }
 
@@ -553,8 +694,18 @@ function escapeMarkdown(value) {
 }
 
 async function executeWorkflowStep(workflowJob, step, index, totalSteps) {
+  const requestedEngine = step.requestedEngine ?? step.engine;
+  const selection = await resolveEngineSelection({
+    requestedEngine,
+    workspaceRoot: workflowJob.workspaceRoot,
+    jobClass: step.kind === "task" ? "task" : step.kind,
+    readOnly: false,
+    scope: step.options?.scope ?? null,
+    baseRef: step.options?.base ?? null
+  });
+  const resolvedEngine = selection.engine ?? requestedEngine;
   const config = getConfig(workflowJob.workspaceRoot);
-  const defaults = getEngineDefaults(config, step.engine);
+  const defaults = getEngineDefaults(config, resolvedEngine);
   const context = buildWorkflowInterpolationContext(workflowJob);
   const resolvedInput =
     step.input == null
@@ -570,7 +721,9 @@ async function executeWorkflowStep(workflowJob, step, index, totalSteps) {
     workflowJob,
     step,
     resolvedInput,
-    resolvedOptions
+    resolvedOptions,
+    engine: resolvedEngine,
+    selection
   });
   const request = buildWorkflowStepRequest(stepJob);
 
@@ -584,24 +737,31 @@ async function executeWorkflowStep(workflowJob, step, index, totalSteps) {
     storedStep.phase = "starting";
     storedStep.startedAt = storedStep.startedAt ?? nowIso();
     storedStep.resolvedInput = resolvedInput;
+    storedStep.requestedEngine = requestedEngine;
+    storedStep.engine = resolvedEngine;
     storedStep.model = stepJob.model ?? null;
     storedStep.effort = stepJob.effort ?? null;
     storedStep.permission = stepJob.permission ?? null;
     storedStep.permissionNative = stepJob.permissionNative ?? null;
     storedStep.permissionSource = stepJob.permissionSource ?? null;
+    storedStep.policyId = selection.policyId ?? null;
+    storedStep.selectionReason = selection.selectionReason ?? null;
+    storedStep.fallbackChain = selection.fallbackChain ?? [];
+    storedStep.routeContext = selection.routeContext ?? null;
+    storedStep.ownerState = createEngineOwnerState(resolvedEngine, "running");
     stored.threadId = null;
     stored.turnId = null;
     stored.sessionRef = null;
   });
   appendLogLine(
     workflowJob.logFile,
-    `${workflowStepLabel(step, index, totalSteps)} started (${step.kind} via ${step.engine}, source=${step.assignmentSource}).`
+    `${workflowStepLabel(step, index, totalSteps)} started (${step.kind} via ${resolvedEngine}, source=${step.assignmentSource}).`
   );
 
   const handle = startEngineRun(request);
   const pumpEvents = (async () => {
     for await (const event of handle.events()) {
-      const progress = engineEventToProgress(event, step.engine);
+      const progress = engineEventToProgress(event, resolvedEngine);
       if (progress.message) {
         appendLogLine(workflowJob.logFile, `${workflowStepLabel(step, index, totalSteps)} ${progress.message}`);
       }
@@ -664,7 +824,7 @@ async function executeWorkflowStep(workflowJob, step, index, totalSteps) {
     storedStep.sessionRef = result.sessionRef ?? storedStep.sessionRef ?? null;
     storedStep.threadId = result.threadId ?? storedStep.threadId ?? null;
     storedStep.turnId = result.turnId ?? storedStep.turnId ?? null;
-    storedStep.ownerState = createEngineOwnerState(step.engine, result.ok ? "completed" : "failed", {
+    storedStep.ownerState = createEngineOwnerState(resolvedEngine, result.ok ? "completed" : "failed", {
       sessionRef: result.sessionRef ?? result.threadId ?? null,
       threadId: result.threadId ?? null,
       turnId: result.turnId ?? null
@@ -766,6 +926,240 @@ async function executeOrchestrateJob(job) {
           threadId: finalStepResult?.threadId ?? null,
           turnId: finalStepResult?.turnId ?? null
         })
+      };
+    },
+    {
+      logFile: job.logFile
+    }
+  );
+}
+
+function buildMatrixReviewerJobLike(job, reviewer) {
+  return {
+    id: `${job.id}:${reviewer.id}`,
+    engine: reviewer.engine,
+    requestedEngine: reviewer.requestedEngine ?? reviewer.engine,
+    policyId: null,
+    selectionReason: null,
+    fallbackChain: [],
+    routeContext: null,
+    jobClass: job.reviewKind,
+    kindLabel: job.reviewKind,
+    title: reviewer.title
+  };
+}
+
+function normalizeConsensusFinding(finding, engine) {
+  if (!finding || typeof finding !== "object" || Array.isArray(finding)) {
+    return null;
+  }
+  const file = typeof finding.file === "string" && finding.file.trim() ? finding.file.trim() : "unknown";
+  const title = typeof finding.title === "string" && finding.title.trim() ? finding.title.trim() : "Finding";
+  const body = typeof finding.body === "string" && finding.body.trim() ? finding.body.trim() : "No details provided.";
+  const lineStart = Number.isInteger(finding.line_start) && finding.line_start > 0 ? finding.line_start : null;
+  const lineEnd = Number.isInteger(finding.line_end) && finding.line_end >= (lineStart ?? 0) ? finding.line_end : lineStart;
+  return {
+    key: JSON.stringify([file, lineStart, lineEnd, title, body]),
+    severity: typeof finding.severity === "string" && finding.severity.trim() ? finding.severity.trim() : "low",
+    title,
+    body,
+    file,
+    line_start: lineStart,
+    line_end: lineEnd,
+    recommendation: typeof finding.recommendation === "string" ? finding.recommendation.trim() : "",
+    engines: [engine]
+  };
+}
+
+function aggregateMatrixReviewConsensus(reviewers) {
+  const completed = reviewers.filter((reviewer) => reviewer.status === "completed");
+  const failed = reviewers.filter((reviewer) => reviewer.status === "failed");
+  const approveCount = completed.filter((reviewer) => reviewer.verdict === "approve").length;
+  const attentionCount = completed.filter((reviewer) => reviewer.verdict === "needs-attention").length;
+  const unstructuredCount = completed.length - approveCount - attentionCount;
+  const mergedFindings = new Map();
+
+  for (const reviewer of completed) {
+    const findings = Array.isArray(reviewer.result?.structured?.findings) ? reviewer.result.structured.findings : [];
+    for (const finding of findings) {
+      const normalized = normalizeConsensusFinding(finding, reviewer.engine);
+      if (!normalized) {
+        continue;
+      }
+      const existing = mergedFindings.get(normalized.key);
+      if (!existing) {
+        mergedFindings.set(normalized.key, normalized);
+        continue;
+      }
+      existing.engines = [...new Set([...existing.engines, reviewer.engine])];
+    }
+  }
+
+  const disagreements = [];
+  if (approveCount > 0 && attentionCount > 0) {
+    disagreements.push(`${approveCount} reviewer(s) approved while ${attentionCount} reviewer(s) flagged issues.`);
+  }
+  if (failed.length > 0) {
+    disagreements.push(`${failed.length} reviewer(s) failed before returning a complete review.`);
+  }
+  if (unstructuredCount > 0) {
+    disagreements.push(`${unstructuredCount} reviewer(s) returned unstructured output that may need manual inspection.`);
+  }
+
+  const verdict = attentionCount > 0 || failed.length > 0 ? "needs-attention" : "approve";
+  const summary =
+    verdict === "approve"
+      ? `All ${completed.length} reviewer(s) approved the change.`
+      : `${attentionCount}/${completed.length || 1} completed reviewer(s) flagged issues${failed.length > 0 ? ` and ${failed.length} reviewer(s) failed.` : "."}`;
+
+  return {
+    verdict,
+    summary,
+    findings: [...mergedFindings.values()].sort((left, right) =>
+      ["critical", "high", "medium", "low"].indexOf(left.severity) - ["critical", "high", "medium", "low"].indexOf(right.severity)
+    ),
+    disagreements
+  };
+}
+
+async function executeMatrixReviewer(matrixJob, reviewer, index, totalReviewers) {
+  let latestMatrixJob = updateWorkflowJobState(matrixJob.workspaceRoot, matrixJob.id, (stored) => {
+    const storedReviewer = stored.reviewers[index];
+    storedReviewer.status = "running";
+    storedReviewer.phase = "starting";
+    storedReviewer.startedAt = storedReviewer.startedAt ?? nowIso();
+    storedReviewer.ownerState = createEngineOwnerState(reviewer.engine, "running");
+    stored.summary = `Running reviewer ${index + 1}/${totalReviewers}: ${reviewer.engine}`;
+    stored.phase = `reviewer ${index + 1}/${totalReviewers} starting`;
+  });
+  appendLogLine(matrixJob.logFile, `Reviewer ${index + 1}/${totalReviewers} started (${reviewer.engine}).`);
+
+  const defaults = getEngineDefaults(getConfig(matrixJob.workspaceRoot), reviewer.engine);
+  const resolvedOptions = applyEngineDefaults(reviewer.engine, {}, defaults, emitWarning);
+  const request = {
+    engine: reviewer.engine,
+    kind: matrixJob.reviewKind,
+    cwd: matrixJob.workspaceRoot,
+    scope: matrixJob.scope,
+    baseRef: matrixJob.baseRef,
+    focusText: matrixJob.focusText,
+    model: resolvedOptions.model ?? null,
+    effort: resolvedOptions.effort ?? null
+  };
+  const handle = startEngineRun(request);
+
+  const pumpEvents = (async () => {
+    for await (const event of handle.events()) {
+      const progress = engineEventToProgress(event, reviewer.engine);
+      if (progress.message) {
+        appendLogLine(matrixJob.logFile, `Reviewer ${reviewer.engine}: ${progress.message}`);
+      }
+      if (progress.logTitle && progress.logBody) {
+        appendLogBlock(matrixJob.logFile, `Reviewer ${reviewer.engine} ${progress.logTitle}`, progress.logBody);
+      }
+      latestMatrixJob = updateWorkflowJobState(matrixJob.workspaceRoot, matrixJob.id, (stored) => {
+        const storedReviewer = stored.reviewers[index];
+        storedReviewer.status = "running";
+        storedReviewer.phase = progress.phase ?? storedReviewer.phase ?? "running";
+        if (progress.message) {
+          storedReviewer.summary = progress.message;
+        }
+        if (progress.sessionRef) {
+          storedReviewer.sessionRef = progress.sessionRef;
+        }
+        if (progress.threadId) {
+          storedReviewer.threadId = progress.threadId;
+        }
+        if (progress.turnId) {
+          storedReviewer.turnId = progress.turnId;
+        }
+        if (progress.ownerState) {
+          storedReviewer.ownerState = progress.ownerState;
+        }
+      });
+    }
+  })();
+
+  let result;
+  try {
+    result = await handle.result();
+  } finally {
+    await pumpEvents;
+  }
+
+  const rendered = renderReview(result, buildMatrixReviewerJobLike(matrixJob, reviewer));
+  const status = result.ok ? "completed" : "failed";
+  const verdict = result.structured?.verdict ?? (result.ok ? "unstructured" : "failed");
+  const summary =
+    result.structured?.summary ??
+    firstMeaningfulLine(result.finalText, `${reviewer.engine} review ${result.ok ? "completed" : "failed"}.`);
+
+  latestMatrixJob = updateWorkflowJobState(matrixJob.workspaceRoot, matrixJob.id, (stored) => {
+    const storedReviewer = stored.reviewers[index];
+    storedReviewer.status = status;
+    storedReviewer.phase = result.ok ? "done" : "failed";
+    storedReviewer.verdict = verdict;
+    storedReviewer.summary = summary;
+    storedReviewer.rendered = rendered;
+    storedReviewer.result = result;
+    storedReviewer.completedAt = nowIso();
+    storedReviewer.sessionRef = result.sessionRef ?? storedReviewer.sessionRef ?? null;
+    storedReviewer.threadId = result.threadId ?? storedReviewer.threadId ?? null;
+    storedReviewer.turnId = result.turnId ?? storedReviewer.turnId ?? null;
+    storedReviewer.ownerState = createEngineOwnerState(reviewer.engine, result.ok ? "completed" : "failed", {
+      sessionRef: result.sessionRef ?? result.threadId ?? null,
+      threadId: result.threadId ?? null,
+      turnId: result.turnId ?? null
+    });
+    stored.targetLabel = stored.targetLabel ?? result.targetLabel ?? null;
+    const finished = stored.reviewers.filter((entry) => entry.status === "completed" || entry.status === "failed").length;
+    stored.summary =
+      finished === totalReviewers ? `Completed ${totalReviewers}/${totalReviewers} reviewers.` : `Completed ${finished}/${totalReviewers} reviewers.`;
+    stored.phase = finished === totalReviewers ? "finalizing" : `reviewer ${finished + 1}/${totalReviewers} running`;
+  });
+
+  appendLogBlock(matrixJob.logFile, `Reviewer ${reviewer.engine} output`, rendered);
+
+  return {
+    reviewer: latestMatrixJob.reviewers[index],
+    result
+  };
+}
+
+async function executeMatrixReviewJob(job) {
+  return runTrackedJob(
+    job,
+    async () => {
+      let matrixJob = readStoredJob(job.workspaceRoot, job.id) ?? job;
+      const totalReviewers = matrixJob.reviewers?.length ?? 0;
+
+      await Promise.all(
+        (matrixJob.reviewers ?? []).map((reviewer, index) => executeMatrixReviewer(matrixJob, reviewer, index, totalReviewers))
+      );
+
+      matrixJob = readStoredJob(job.workspaceRoot, job.id) ?? matrixJob;
+      const consensus = aggregateMatrixReviewConsensus(matrixJob.reviewers ?? []);
+      const hadFailures = (matrixJob.reviewers ?? []).some((reviewer) => reviewer.status === "failed");
+      const finalized = updateWorkflowJobState(job.workspaceRoot, job.id, (stored) => {
+        stored.consensus = consensus;
+        stored.summary = consensus.summary;
+        stored.phase = hadFailures ? "failed" : "done";
+      });
+
+      return {
+        exitStatus: hadFailures ? 1 : 0,
+        payload: {
+          consensus,
+          reviewers: finalized.reviewers,
+          targetLabel: finalized.targetLabel ?? null
+        },
+        rendered: renderMatrixReviewResult(finalized),
+        summary: consensus.summary,
+        threadId: null,
+        turnId: null,
+        sessionRef: null,
+        capabilities: getEngineRuntimeCapabilities("multi"),
+        ownerState: createEngineOwnerState("multi", hadFailures ? "failed" : "completed")
       };
     },
     {
@@ -965,6 +1359,9 @@ async function handleSetup(argv) {
   if (options["enable-review-gate"] && options["disable-review-gate"]) {
     throw new Error("Choose either --enable-review-gate or --disable-review-gate.");
   }
+  if (normalizeRequestedEngineInput(options.engine, { allowAuto: true }) === AUTO_ENGINE_ID) {
+    throw new Error("`setup` does not accept `--engine auto`. Use `/cc:policy` to configure auto routing.");
+  }
   if (options.all && (options.model != null || options.effort != null || options.permission != null)) {
     throw new Error("Use --engine when setting default --model, --effort, or --permission.");
   }
@@ -1015,13 +1412,22 @@ async function handleReview(argv, kind) {
 
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const engine = resolveEngine(options, workspaceRoot);
+  const requestedEngine = resolveRequestedEngine(options, workspaceRoot, { allowAuto: true });
   const focusText = positionals.join(" ").trim();
   if (kind === "review" && focusText) {
     throw new Error(
-      `\`/cc:review\` does not support custom focus text. Retry with \`/cc:adversarial-review --engine ${engine} ${focusText}\` for focused review instructions.`
+      `\`/cc:review\` does not support custom focus text. Retry with \`/cc:adversarial-review --engine ${requestedEngine} ${focusText}\` for focused review instructions.`
     );
   }
+  const selection = await resolveEngineSelection({
+    requestedEngine,
+    workspaceRoot,
+    jobClass: kind,
+    readOnly: true,
+    scope: options.scope ?? null,
+    baseRef: options.base ?? null
+  });
+  const engine = selection.engine ?? requestedEngine;
   const resolvedOptions = applyEngineDefaults(engine, options, getEngineDefaults(getConfig(workspaceRoot), engine), emitWarning);
   const job = createReviewJob({
     workspaceRoot,
@@ -1029,7 +1435,8 @@ async function handleReview(argv, kind) {
     engine,
     kind,
     options: resolvedOptions,
-    focusText
+    focusText,
+    selection
   });
 
   if (resolveBackground(options)) {
@@ -1056,7 +1463,16 @@ async function handleTask(argv, { jobClass = "task", readOnly = false } = {}) {
 
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const engine = resolveEngine(options, workspaceRoot);
+  const requestedEngine = resolveRequestedEngine(options, workspaceRoot, { allowAuto: true });
+  const selection = await resolveEngineSelection({
+    requestedEngine,
+    workspaceRoot,
+    jobClass,
+    readOnly,
+    scope: null,
+    baseRef: null
+  });
+  const engine = selection.engine ?? requestedEngine;
   const resolvedOptions = readOnly
     ? applyEngineDefaults(engine, options, getEngineDefaults(getConfig(workspaceRoot), engine), emitWarning)
     : applyTaskDefaults(engine, options, getEngineDefaults(getConfig(workspaceRoot), engine), emitWarning);
@@ -1067,7 +1483,8 @@ async function handleTask(argv, { jobClass = "task", readOnly = false } = {}) {
     options: resolvedOptions,
     prompt: positionals.join(" ").trim(),
     readOnly,
-    jobClass
+    jobClass,
+    selection
   });
 
   job = await maybePopulateResumeSession(job);
@@ -1115,6 +1532,150 @@ async function handleOrchestrate(argv) {
   outputResult(options.json ? execution.payload : execution.rendered, Boolean(options.json));
 }
 
+async function handleMatrixReview(argv) {
+  const { options, positionals } = parseCommandInput(argv, {
+    valueOptions: ["cwd", "engines", "scope", "base"],
+    booleanOptions: ["json", "background", "wait"]
+  });
+
+  const cwd = resolveCommandCwd(options);
+  const workspaceRoot = resolveWorkspaceRoot(cwd);
+  const focusText = positionals.join(" ").trim();
+  const selection = await resolveMatrixReviewEngines({
+    cwd: workspaceRoot,
+    requestedEngines: options.engines ?? null,
+    config: getConfig(workspaceRoot)
+  });
+  const job = createMatrixReviewJob({
+    workspaceRoot,
+    cwd,
+    engines: selection.engines,
+    options,
+    focusText,
+    selection
+  });
+
+  if (resolveBackground(options)) {
+    const pid = spawnBackgroundWorker(job);
+    const queuedJob = storeQueuedJob(job, pid);
+    outputResult(options.json ? queuedJob : `Started ${job.id} in background (pid ${pid}).\n`, Boolean(options.json));
+    return;
+  }
+
+  const execution = await executeMatrixReviewJob(job);
+  process.exitCode = execution.exitStatus;
+  outputResult(options.json ? execution.payload : execution.rendered, Boolean(options.json));
+}
+
+function renderReplayReport(job, storedJob, logText) {
+  const lines = [
+    "# cli-plugin-cc replay",
+    "",
+    `Job: ${job.id}`,
+    `Status: ${storedJob?.status ?? job.status}`,
+    `Kind: ${storedJob?.jobClass ?? job.jobClass}`,
+    `Engine: ${storedJob?.engine ?? job.engine}`
+  ];
+
+  if (storedJob?.summary || job.summary) {
+    lines.push(`Summary: ${storedJob?.summary ?? job.summary}`);
+  }
+  if (storedJob?.selectionReason || job.selectionReason) {
+    lines.push(`Routing: ${storedJob?.selectionReason ?? job.selectionReason}`);
+  }
+  lines.push("", "Timeline:", "", "```text", (logText || "(no log captured)").trimEnd(), "```");
+
+  if (storedJob?.rendered) {
+    lines.push("", "Result:", "", storedJob.rendered.trimEnd());
+  }
+
+  return `${lines.join("\n").trimEnd()}\n`;
+}
+
+function handlePolicy(argv) {
+  const { options } = parseCommandInput(argv, {
+    valueOptions: ["cwd", "set", "matrix-engines", "threshold-files", "threshold-lines"],
+    booleanOptions: ["json", "prefer-auto", "disable-auto"]
+  });
+
+  if (options["prefer-auto"] && options["disable-auto"]) {
+    throw new Error("Choose either --prefer-auto or --disable-auto.");
+  }
+
+  const cwd = resolveCommandCwd(options);
+  const workspaceRoot = resolveWorkspaceRoot(cwd);
+  const config = getConfig(workspaceRoot);
+  const nextAutoRouting = {
+    ...(config.autoRouting ?? {})
+  };
+
+  if (options.set != null) {
+    nextAutoRouting.policy = parsePolicyPreset(options.set);
+  }
+  if (options["prefer-auto"]) {
+    nextAutoRouting.preferAutoRouting = true;
+  }
+  if (options["disable-auto"]) {
+    nextAutoRouting.preferAutoRouting = false;
+  }
+  if (options["matrix-engines"] != null) {
+    nextAutoRouting.matrixReviewEngines = parseEngineList(options["matrix-engines"]);
+  }
+  if (options["threshold-files"] != null) {
+    nextAutoRouting.largeReviewFileThreshold = Number.parseInt(options["threshold-files"], 10);
+  }
+  if (options["threshold-lines"] != null) {
+    nextAutoRouting.largeReviewLineThreshold = Number.parseInt(options["threshold-lines"], 10);
+  }
+
+  if (
+    options.set != null ||
+    options["prefer-auto"] ||
+    options["disable-auto"] ||
+    options["matrix-engines"] != null ||
+    options["threshold-files"] != null ||
+    options["threshold-lines"] != null
+  ) {
+    setConfig(workspaceRoot, {
+      autoRouting: nextAutoRouting
+    });
+  }
+
+  const report = buildPolicyReport(getConfig(workspaceRoot).autoRouting);
+  outputResult(options.json ? report : renderPolicyReport(report), Boolean(options.json));
+}
+
+function handleMemory(argv) {
+  const { options } = parseCommandInput(argv, {
+    valueOptions: ["cwd"],
+    booleanOptions: ["json"]
+  });
+
+  const cwd = resolveCommandCwd(options);
+  const snapshot = buildWorkspaceMemorySnapshot(cwd);
+  outputResult(options.json ? snapshot : renderWorkspaceMemory(snapshot), Boolean(options.json));
+}
+
+function handleReplay(argv) {
+  const { options, positionals } = parseCommandInput(argv, {
+    valueOptions: ["cwd"],
+    booleanOptions: ["json", "all"]
+  });
+
+  const cwd = resolveCommandCwd(options);
+  const { workspaceRoot, job } = resolveResultJob(cwd, positionals[0] ?? null, {
+    all: Boolean(options.all)
+  });
+  const storedJob = readStoredJob(workspaceRoot, job.id);
+  const logFile = storedJob?.logFile ?? job.logFile ?? null;
+  const logText = logFile && fs.existsSync(logFile) ? fs.readFileSync(logFile, "utf8") : "";
+  const payload = {
+    job: storedJob ?? job,
+    log: logText
+  };
+  outputResult(options.json ? payload : renderReplayReport(job, storedJob, logText), Boolean(options.json));
+}
+
 async function handleStatus(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["cwd", "timeout-ms", "poll-ms", "poll-interval-ms"],
@@ -1151,7 +1712,10 @@ function handleTaskResumeCandidate(argv) {
 
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const engine = normalizeEngine(options.engine || getConfig(workspaceRoot).defaultEngine);
+  const engine = normalizeRequestedEngineInput(options.engine || getConfig(workspaceRoot).defaultEngine);
+  if (engine === AUTO_ENGINE_ID) {
+    throw new Error("`task-resume-candidate` does not accept `--engine auto`.");
+  }
   const candidates = listResumeCandidates(workspaceRoot, engine, {
     all: Boolean(options.all)
   });
@@ -1272,6 +1836,11 @@ async function runBackgroundWorker(jobId, argv) {
           ...job,
           workspaceRoot
         })
+      : job.jobClass === "matrix-review"
+        ? await executeMatrixReviewJob({
+            ...job,
+            workspaceRoot
+          })
       : await executeJob({
           ...job,
           workspaceRoot
@@ -1294,17 +1863,29 @@ async function main() {
     case "setup":
       await handleSetup(argv);
       return;
+    case "policy":
+      handlePolicy(argv);
+      return;
     case "review":
       await handleReview(argv, "review");
       return;
     case "adversarial-review":
       await handleReview(argv, "adversarial-review");
       return;
+    case "memory":
+      handleMemory(argv);
+      return;
+    case "replay":
+      handleReplay(argv);
+      return;
     case "task":
       await handleTask(argv);
       return;
     case "orchestrate":
       await handleOrchestrate(argv);
+      return;
+    case "matrix-review":
+      await handleMatrixReview(argv);
       return;
     case "gate":
       await handleTask(argv, { jobClass: "gate", readOnly: true });

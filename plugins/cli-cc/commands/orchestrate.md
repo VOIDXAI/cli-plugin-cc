@@ -29,7 +29,9 @@ git diff --shortstat
 ```
 
 Planning defaults:
-- Default role mapping:
+- Prefer `engine: "auto"` for steps the user did not explicitly pin so the runtime policy can route them at execution time.
+- If the user clearly asked for a specific engine, keep it fixed in the plan.
+- If you need a concrete fallback mapping while drafting, use:
   - Codex for implementation or rescue work
   - Gemini for adversarial review
   - Droid for final review
@@ -69,6 +71,7 @@ Plan file requirements:
 - The JSON must match the runtime schema:
   - top-level: `version`, `title`, `task`, `steps`
   - each step: `id`, `title`, `engine`, `assignmentSource`, `kind`, `input`, `options`
+  - supported step engines: `codex`, `gemini`, `droid`, `auto`
 - Keep step ids stable when revising a plan unless the structure truly changed.
 
 Output rules:

@@ -13,6 +13,11 @@ const ENABLE_CANCEL_SMOKE = process.env.CLI_PLUGIN_CC_LIVE_CANCEL === "1";
 const ENABLE_FULL_SMOKE = process.env.CLI_PLUGIN_CC_LIVE_FULL === "1";
 const GEMINI_HARD_TIMEOUT_SECONDS = 600;
 const GEMINI_HARD_TIMEOUT_GRACE_SECONDS = 15;
+const ENGINE_BIN_ENV = {
+  codex: "CLI_PLUGIN_CC_CODEX_BIN",
+  gemini: "CLI_PLUGIN_CC_GEMINI_BIN",
+  droid: "CLI_PLUGIN_CC_DROID_BIN"
+};
 const DEFAULT_LIVE_MODELS = {
   gemini: "gemini-2.5-flash-lite"
 };
@@ -41,18 +46,34 @@ function requestedEngines() {
   );
 }
 
-function liveEnv(dataDir) {
+function buildDisabledEngineEnv(allowedEngineIds = null) {
+  if (!Array.isArray(allowedEngineIds) || allowedEngineIds.length === 0) {
+    return {};
+  }
+
+  const allowed = new Set(allowedEngineIds);
+  const overrides = {};
+  for (const [engineId, envKey] of Object.entries(ENGINE_BIN_ENV)) {
+    if (!allowed.has(engineId)) {
+      overrides[envKey] = `__cli_plugin_cc_disabled_${engineId}__`;
+    }
+  }
+  return overrides;
+}
+
+function liveEnv(dataDir, allowedEngineIds = null) {
   return {
     ...process.env,
-    CLI_PLUGIN_CC_DATA_DIR: dataDir
+    CLI_PLUGIN_CC_DATA_DIR: dataDir,
+    ...buildDisabledEngineEnv(allowedEngineIds)
   };
 }
 
-function runCompanion(args, { cwd, dataDir, timeout = LIVE_TIMEOUT_MS, engineId = null } = {}) {
+function runCompanion(args, { cwd, dataDir, timeout = LIVE_TIMEOUT_MS, engineId = null, allowedEngineIds = null } = {}) {
   const runArgs = [SCRIPT, ...args];
   const options = {
     cwd,
-    env: liveEnv(dataDir),
+    env: liveEnv(dataDir, allowedEngineIds),
     timeout
   };
   if (engineId === "gemini") {
@@ -113,6 +134,34 @@ function formatResult(result) {
   return `exit:\nstatus=${result.status ?? "(null)"} signal=${result.signal ?? "(null)"}\nstdout:\n${result.stdout || "(empty)"}\nstderr:\n${result.stderr || "(empty)"}`;
 }
 
+function assertStdoutMatches(result, pattern, label) {
+  if (!pattern.test(result.stdout || "")) {
+    throw new Error(`${label}\n${formatResult(result)}`);
+  }
+}
+
+function parseRenderedEngineId(stdout) {
+  return stdout.match(/^# [^(]+\(([^)]+)\)/m)?.[1] ?? null;
+}
+
+function preferredAutoReviewEngine(engineIds) {
+  for (const candidate of ["gemini", "droid", "codex"]) {
+    if (engineIds.includes(candidate)) {
+      return candidate;
+    }
+  }
+  return engineIds[0] ?? null;
+}
+
+function preferredAutoTaskEngine(engineIds) {
+  for (const candidate of ["droid", "codex", "gemini"]) {
+    if (engineIds.includes(candidate)) {
+      return candidate;
+    }
+  }
+  return engineIds[0] ?? null;
+}
+
 function maybeTransientFailure(engineId, stage, result) {
   if (!isTransientProviderFailure(result)) {
     return null;
@@ -130,6 +179,20 @@ function assertSucceeded(result, label) {
   }
 }
 
+function configureLiveDefaults(runRepoCompanion, engineIds) {
+  for (const engineId of engineIds) {
+    const model = liveModelFor(engineId);
+    if (!model) {
+      continue;
+    }
+    const setup = runRepoCompanion(["setup", "--engine", engineId, "--model", model], {
+      engineId,
+      timeout: 120000
+    });
+    assertSucceeded(setup, `${engineId} live default model setup`);
+  }
+}
+
 async function runEngineSmoke(engineId) {
   const repoDir = makeRepo();
   const dataDir = makeTempDir();
@@ -138,6 +201,7 @@ async function runEngineSmoke(engineId) {
       cwd: repoDir,
       dataDir,
       engineId,
+      allowedEngineIds: [engineId],
       ...options
     });
 
@@ -213,6 +277,10 @@ async function runEngineSmoke(engineId) {
 
   const result = runEngineCompanion(["result", backgroundJobId]);
   assertSucceeded(result, `${engineId} result`);
+  const replay = runEngineCompanion(["replay", backgroundJobId]);
+  assertSucceeded(replay, `${engineId} replay`);
+  assertStdoutMatches(replay, /# cli-plugin-cc replay/, `${engineId} replay header`);
+  assertStdoutMatches(replay, new RegExp(`Job: ${backgroundJobId}`), `${engineId} replay job id`);
 
   if (ENABLE_CANCEL_SMOKE) {
     const cancellable = runEngineCompanion(
@@ -259,6 +327,111 @@ async function runEngineSmoke(engineId) {
   return { status: "passed" };
 }
 
+async function runSharedFeatureSmoke(readyEngineIds) {
+  const repoDir = makeRepo();
+  const dataDir = makeTempDir();
+  const runRepoCompanion = (args, options = {}) =>
+    runCompanion(args, {
+      cwd: repoDir,
+      dataDir,
+      allowedEngineIds: readyEngineIds,
+      ...options
+    });
+
+  configureLiveDefaults(runRepoCompanion, readyEngineIds);
+
+  const matrixEngineIds = readyEngineIds.slice(0, Math.min(readyEngineIds.length, 3));
+  const policy = runRepoCompanion([
+    "policy",
+    "--set",
+    "speed-first",
+    "--prefer-auto",
+    "--matrix-engines",
+    matrixEngineIds.join(",")
+  ]);
+  assertSucceeded(policy, "shared feature smoke policy");
+  assertStdoutMatches(policy, /# cli-plugin-cc policy/, "shared feature smoke policy header");
+  assertStdoutMatches(policy, /Auto routing by default: enabled/, "shared feature smoke policy enablement");
+  if (matrixEngineIds.length > 0) {
+    assertStdoutMatches(
+      policy,
+      new RegExp(`Matrix review engines: ${matrixEngineIds.join(", ")}`),
+      "shared feature smoke matrix engine config"
+    );
+  }
+
+  const autoReviewEngine = preferredAutoReviewEngine(readyEngineIds);
+  const autoReview = runRepoCompanion(["review", "--engine", "auto"], {
+    engineId: autoReviewEngine
+  });
+  const autoReviewTransient = maybeTransientFailure(autoReviewEngine, "auto review", autoReview);
+  if (autoReviewTransient) {
+    return { status: "skipped", reason: autoReviewTransient };
+  }
+  assertSucceeded(autoReview, "shared feature smoke auto review");
+  assertStdoutMatches(autoReview, /^# Review \([^)]+\)/m, "shared feature smoke auto review header");
+  assertStdoutMatches(autoReview, /Requested engine: auto/, "shared feature smoke auto review routing");
+  assertStdoutMatches(autoReview, /Policy: speed-first/, "shared feature smoke auto review policy");
+  const renderedReviewEngine = parseRenderedEngineId(autoReview.stdout);
+  if (!renderedReviewEngine || !readyEngineIds.includes(renderedReviewEngine)) {
+    throw new Error(`shared feature smoke auto review selected unexpected engine.\n${formatResult(autoReview)}`);
+  }
+
+  const autoTaskEngine = preferredAutoTaskEngine(readyEngineIds);
+  const autoTask = runRepoCompanion(["task", "Summarize", "the", "current", "repository", "state", "briefly."], {
+    engineId: autoTaskEngine
+  });
+  const autoTaskTransient = maybeTransientFailure(autoTaskEngine, "auto task", autoTask);
+  if (autoTaskTransient) {
+    return { status: "skipped", reason: autoTaskTransient };
+  }
+  assertSucceeded(autoTask, "shared feature smoke auto task");
+  assertStdoutMatches(autoTask, /^# Rescue Result \([^)]+\)/m, "shared feature smoke auto task header");
+  assertStdoutMatches(autoTask, /Requested engine: auto/, "shared feature smoke auto task routing");
+  assertStdoutMatches(autoTask, /Policy: speed-first/, "shared feature smoke auto task policy");
+  const renderedTaskEngine = parseRenderedEngineId(autoTask.stdout);
+  if (!renderedTaskEngine || !readyEngineIds.includes(renderedTaskEngine)) {
+    throw new Error(`shared feature smoke auto task selected unexpected engine.\n${formatResult(autoTask)}`);
+  }
+
+  if (matrixEngineIds.length >= 2) {
+    const matrixDriverEngine = matrixEngineIds.includes("gemini") ? "gemini" : matrixEngineIds[0];
+    const matrix = runRepoCompanion(["matrix-review", "Challenge", "the", "current", "change", "and", "look", "for", "risks."], {
+      engineId: matrixDriverEngine
+    });
+    const matrixTransient = maybeTransientFailure(matrixDriverEngine, "matrix review", matrix);
+    if (matrixTransient) {
+      return { status: "skipped", reason: matrixTransient };
+    }
+    assertSucceeded(matrix, "shared feature smoke matrix review");
+    assertStdoutMatches(matrix, /^# Matrix Review/m, "shared feature smoke matrix review header");
+    for (const engineId of matrixEngineIds) {
+      assertStdoutMatches(
+        matrix,
+        new RegExp(`## Reviewer \\d+: ${engineId}`),
+        `shared feature smoke matrix reviewer ${engineId}`
+      );
+    }
+
+    const matrixResult = runRepoCompanion(["result"]);
+    assertSucceeded(matrixResult, "shared feature smoke matrix result");
+    assertStdoutMatches(matrixResult, /^# Matrix Review/m, "shared feature smoke matrix result header");
+
+    const matrixReplay = runRepoCompanion(["replay"]);
+    assertSucceeded(matrixReplay, "shared feature smoke matrix replay");
+    assertStdoutMatches(matrixReplay, /# cli-plugin-cc replay/, "shared feature smoke matrix replay header");
+    assertStdoutMatches(matrixReplay, /Kind: matrix-review/, "shared feature smoke matrix replay kind");
+  }
+
+  const memory = runRepoCompanion(["memory"]);
+  assertSucceeded(memory, "shared feature smoke memory");
+  assertStdoutMatches(memory, /# cli-plugin-cc memory/, "shared feature smoke memory header");
+  assertStdoutMatches(memory, /Jobs tracked:/, "shared feature smoke memory jobs");
+  assertStdoutMatches(memory, /Auto-routing history:/, "shared feature smoke memory auto routing");
+
+  return { status: "passed" };
+}
+
 async function main() {
   console.log("# cli-plugin-cc live smoke");
   console.log("");
@@ -268,6 +441,7 @@ async function main() {
   const setup = runCompanion(["setup", "--all", "--json"], {
     cwd: ROOT,
     dataDir: setupDataDir,
+    allowedEngineIds: filter ? [...filter] : null,
     timeout: 120000
   });
   assertSucceeded(setup, "live setup --all");
@@ -313,6 +487,25 @@ async function main() {
     } catch (error) {
       summary.failed += 1;
       console.log(`FAIL ${engineId}: ${error.message || error}`);
+    }
+    console.log("");
+  }
+
+  const readyEngineIds = targetIds.filter((engineId) => !skipReason(engines.get(engineId)));
+  if (readyEngineIds.length > 0) {
+    console.log(`RUN  shared-features (${readyEngineIds.join(", ")})`);
+    try {
+      const result = await runSharedFeatureSmoke(readyEngineIds);
+      if (result.status === "skipped") {
+        summary.skipped += 1;
+        console.log(`SKIP shared-features: ${result.reason}`);
+      } else {
+        summary.passed += 1;
+        console.log("PASS shared-features");
+      }
+    } catch (error) {
+      summary.failed += 1;
+      console.log(`FAIL shared-features: ${error.message || error}`);
     }
     console.log("");
   }

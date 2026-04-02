@@ -1,6 +1,6 @@
 ---
-description: Run a read-only review through Codex, Gemini, or Droid.
-argument-hint: '[--engine <codex|gemini|droid>] [--wait|--background] [--model <id>] [--effort none|minimal|low|medium|high|xhigh] [--base <ref>] [--scope auto|working-tree|branch]'
+description: Run a read-only review through Codex, Gemini, or Droid, with optional auto routing.
+argument-hint: '[--engine <codex|gemini|droid|auto>] [--wait|--background] [--model <id>] [--effort none|minimal|low|medium|high|xhigh] [--base <ref>] [--scope auto|working-tree|branch]'
 disable-model-invocation: true
 allowed-tools: Bash, AskUserQuestion
 ---
@@ -33,6 +33,8 @@ Execution mode rules:
 Argument handling:
 - Preserve the user's arguments exactly.
 - Do not strip `--wait` or `--background` yourself.
+- `--engine auto` is valid and lets the runtime select the best ready engine from the current `/cc:policy`.
+- If the user omits `--engine` and `/cc:policy --prefer-auto` is enabled for this repo, the runtime may still auto-route the review.
 - `/cc:review` does not support custom focus text. For focused instructions, use `/cc:adversarial-review`.
 - The companion script parses `--wait` and `--background`, but Claude Code's `Bash(..., run_in_background: true)` is what actually detaches the run.
 

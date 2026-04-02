@@ -421,9 +421,29 @@ test("gemini review accepts fenced json payloads and normalizes range-based find
   });
 
   assert.equal(result.status, 0, result.stderr);
-  assert.match(result.stdout, /Verdict: approved/);
+  assert.match(result.stdout, /Verdict: approve/);
   assert.match(result.stdout, /\[info\] Finding 1 \(src\/app\.js:2-4\)/);
   assert.match(result.stdout, /Guarding empty arrays avoids an undefined access\./);
+});
+
+test("gemini review infers a verdict from findings-only structured payloads", () => {
+  const binDir = makeTempDir();
+  const dataDir = makeTempDir();
+  installFakeEngines(binDir);
+  const repoDir = makeRepo();
+
+  const result = run(process.execPath, [SCRIPT, "adversarial-review", "--engine", "gemini", "Challenge the null-handling change"], {
+    cwd: repoDir,
+    env: {
+      ...envFor(binDir, dataDir),
+      FAKE_GEMINI_FINDINGS_ONLY_REVIEW: "1"
+    }
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /# Adversarial Review \(gemini\)/);
+  assert.match(result.stdout, /Verdict: needs-attention/);
+  assert.match(result.stdout, /silently returning null/);
 });
 
 test("review can route to droid using stream-json and review effort", () => {
@@ -618,6 +638,26 @@ test("droid adversarial review accepts decision-shaped structured output", () =>
   assert.match(result.stdout, /# Adversarial Review \(droid\)/);
   assert.match(result.stdout, /Verdict: needs-attention/);
   assert.match(result.stdout, /Droid decision-mode review found one issue\./);
+});
+
+test("droid review accepts status-shaped structured output", () => {
+  const binDir = makeTempDir();
+  const dataDir = makeTempDir();
+  installFakeEngines(binDir);
+  const repoDir = makeRepo();
+
+  const result = run(process.execPath, [SCRIPT, "review", "--engine", "droid"], {
+    cwd: repoDir,
+    env: {
+      ...envFor(binDir, dataDir),
+      FAKE_DROID_STATUS_REVIEW: "1"
+    }
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /# Review \(droid\)/);
+  assert.match(result.stdout, /Verdict: approve/);
+  assert.match(result.stdout, /Droid status-mode review found no material issues\./);
 });
 
 test("invalid effort values are rejected before the engine starts", () => {
@@ -1529,4 +1569,146 @@ test("cancel marks a running orchestration workflow and its active step as cance
     const parsed = JSON.parse(status.stdout);
     return parsed.job.status === "cancelled" && parsed.job.steps?.[0]?.status === "cancelled";
   });
+});
+
+test("policy persists repo-local auto routing and review/task runs expose the selected engine", () => {
+  const binDir = makeTempDir();
+  const dataDir = makeTempDir();
+  const fixtures = installFakeEngines(binDir);
+  const repoDir = makeRepo();
+
+  const policy = run(
+    process.execPath,
+    [
+      SCRIPT,
+      "policy",
+      "--set",
+      "speed-first",
+      "--prefer-auto",
+      "--matrix-engines",
+      "gemini,droid",
+      "--threshold-files",
+      "2",
+      "--threshold-lines",
+      "20",
+      "--json"
+    ],
+    {
+      cwd: repoDir,
+      env: envFor(binDir, dataDir)
+    }
+  );
+  assert.equal(policy.status, 0, policy.stderr);
+  const policyPayload = JSON.parse(policy.stdout);
+  assert.equal(policyPayload.config.policy, "speed-first");
+  assert.equal(policyPayload.config.preferAutoRouting, true);
+  assert.deepEqual(policyPayload.config.matrixReviewEngines, ["gemini", "droid"]);
+  assert.equal(policyPayload.config.largeReviewFileThreshold, 2);
+  assert.equal(policyPayload.config.largeReviewLineThreshold, 20);
+
+  const task = run(process.execPath, [SCRIPT, "task", "investigate", "the", "failure"], {
+    cwd: repoDir,
+    env: envFor(binDir, dataDir)
+  });
+  assert.equal(task.status, 0, task.stderr);
+  assert.match(task.stdout, /# Rescue Result \(droid\)/);
+  assert.match(task.stdout, /Requested engine: auto/);
+  assert.match(task.stdout, /Selected engine: droid/);
+  assert.match(task.stdout, /Policy: speed-first/);
+
+  const review = run(process.execPath, [SCRIPT, "review", "--engine", "auto"], {
+    cwd: repoDir,
+    env: envFor(binDir, dataDir)
+  });
+  assert.equal(review.status, 0, review.stderr);
+  assert.match(review.stdout, /# Review \(gemini\)/);
+  assert.match(review.stdout, /Requested engine: auto/);
+  assert.match(review.stdout, /Selected engine: gemini/);
+  assert.match(review.stdout, /Policy: speed-first/);
+
+  const droidLog = readJsonLines(fixtures.droidLogPath);
+  const geminiLog = readJsonLines(fixtures.geminiLogPath);
+  assert.equal(droidLog.length, 1);
+  assert.equal(geminiLog.length, 1);
+});
+
+test("matrix-review stores a consensus result and replay returns the timeline", () => {
+  const binDir = makeTempDir();
+  const dataDir = makeTempDir();
+  installFakeEngines(binDir);
+  const repoDir = makeRepo();
+
+  const matrix = run(process.execPath, [SCRIPT, "matrix-review", "--engines", "codex,droid", "look", "for", "guard", "bugs"], {
+    cwd: repoDir,
+    env: envFor(binDir, dataDir)
+  });
+  assert.equal(matrix.status, 0, matrix.stderr);
+  assert.match(matrix.stdout, /# Matrix Review/);
+  assert.match(matrix.stdout, /Consensus: needs-attention/);
+  assert.match(matrix.stdout, /Kind: adversarial-review/);
+  assert.match(matrix.stdout, /## Reviewer 1: codex/);
+  assert.match(matrix.stdout, /## Reviewer 2: droid/);
+
+  const stored = run(process.execPath, [SCRIPT, "result"], {
+    cwd: repoDir,
+    env: envFor(binDir, dataDir)
+  });
+  assert.equal(stored.status, 0, stored.stderr);
+  assert.match(stored.stdout, /# Matrix Review/);
+  assert.match(stored.stdout, /Consensus: needs-attention/);
+  assert.match(stored.stdout, /Reviewer 1: codex/);
+  assert.match(stored.stdout, /Reviewer 2: droid/);
+
+  const replay = run(process.execPath, [SCRIPT, "replay"], {
+    cwd: repoDir,
+    env: envFor(binDir, dataDir)
+  });
+  assert.equal(replay.status, 0, replay.stderr);
+  assert.match(replay.stdout, /# cli-plugin-cc replay/);
+  assert.match(replay.stdout, /Kind: matrix-review/);
+  assert.match(replay.stdout, /Timeline:/);
+  assert.match(replay.stdout, /Reviewer 1\/2 started \(codex\)/);
+  assert.match(replay.stdout, /Reviewer 2\/2 started \(droid\)/);
+  assert.match(replay.stdout, /Result:/);
+});
+
+test("memory summarizes recommendations, recent results, and auto-routing history", () => {
+  const binDir = makeTempDir();
+  const dataDir = makeTempDir();
+  installFakeEngines(binDir);
+  const repoDir = makeRepo();
+
+  const policy = run(process.execPath, [SCRIPT, "policy", "--set", "speed-first", "--prefer-auto"], {
+    cwd: repoDir,
+    env: envFor(binDir, dataDir)
+  });
+  assert.equal(policy.status, 0, policy.stderr);
+
+  const task = run(process.execPath, [SCRIPT, "task", "investigate", "the", "failure"], {
+    cwd: repoDir,
+    env: envFor(binDir, dataDir)
+  });
+  assert.equal(task.status, 0, task.stderr);
+
+  const review = run(process.execPath, [SCRIPT, "review", "--engine", "auto"], {
+    cwd: repoDir,
+    env: envFor(binDir, dataDir)
+  });
+  assert.equal(review.status, 0, review.stderr);
+
+  const memory = run(process.execPath, [SCRIPT, "memory"], {
+    cwd: repoDir,
+    env: envFor(binDir, dataDir)
+  });
+  assert.equal(memory.status, 0, memory.stderr);
+  assert.match(memory.stdout, /# cli-plugin-cc memory/);
+  assert.match(memory.stdout, /Jobs tracked: 2/);
+  assert.match(memory.stdout, /Completed: 2/);
+  assert.match(memory.stdout, /Recommended engines:/);
+  assert.match(memory.stdout, /task: droid \(100% success over 1 finished run\(s\)\)/);
+  assert.match(memory.stdout, /review: gemini \(100% success over 1 finished run\(s\)\)/);
+  assert.match(memory.stdout, /Auto-routing history:/);
+  assert.match(memory.stdout, /gemini: selected 1 time\(s\)/);
+  assert.match(memory.stdout, /droid: selected 1 time\(s\)/);
+  assert.match(memory.stdout, /Recent successes:/);
 });

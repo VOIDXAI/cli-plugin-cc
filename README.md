@@ -1,6 +1,6 @@
 # cli-plugin-cc
 
-Use Codex, Gemini, or Droid from inside Claude Code for code reviews or to delegate tasks through one shared `/cc:*` workflow.
+Use Codex, Gemini, or Droid from inside Claude Code for code reviews, auto-routed delegation, and multi-engine consensus workflows through one shared `/cc:*` surface.
 
 This plugin is for Claude Code users who want one command surface for multi-engine review, rescue, and background job handling without leaving the repo they already have open.
 
@@ -8,10 +8,13 @@ This plugin is for Claude Code users who want one command surface for multi-engi
 
 - `/cc:review` for a normal read-only review
 - `/cc:adversarial-review` for a steerable challenge review
+- `/cc:matrix-review` for a parallel multi-engine review with a consensus summary
 - `/cc:orchestrate` to plan a multi-engine workflow, let the user adjust it, then execute after confirmation
+- `/cc:policy` to configure auto routing and default matrix-review engines for this repo
+- `/cc:memory` and `/cc:replay` to inspect prior `/cc` runs
 - `/cc:rescue`, `/cc:status`, `/cc:result`, and `/cc:cancel` to delegate work and manage background jobs
 - `/cc:setup` to check engine readiness, save defaults for this repo, and manage the optional review gate
-- one place to track jobs, view results, cancel runs, and continue earlier work
+- one place to track jobs, view results, replay timelines, cancel runs, and continue earlier work
 
 ## Requirements
 
@@ -64,6 +67,7 @@ After install, you should see:
 One simple first run is:
 
 ```bash
+/cc:policy --prefer-auto
 /cc:review --engine codex --background
 /cc:status
 /cc:result
@@ -74,6 +78,7 @@ One simple first run is:
 ### `/cc:review`
 
 Runs a normal review on your current work through the selected engine.
+`--engine auto` is supported, and if you enable `/cc:policy --prefer-auto` you can also omit `--engine`.
 
 Use it when you want:
 
@@ -87,6 +92,7 @@ Examples:
 
 ```bash
 /cc:review --engine codex
+/cc:review --engine auto
 /cc:review --engine gemini --base main
 /cc:review --engine droid --background
 ```
@@ -112,11 +118,32 @@ Examples:
 
 ```bash
 /cc:adversarial-review --engine codex
+/cc:adversarial-review --engine auto challenge whether this caching strategy is actually safe
 /cc:adversarial-review --engine codex --base main challenge whether this was the right caching and retry design
 /cc:adversarial-review --engine gemini --background look for race conditions and question the chosen approach
 ```
 
 This command is read-only. It does not fix code.
+
+### `/cc:matrix-review`
+
+Runs the same challenge review through multiple engines, then stores a combined consensus plus each reviewer’s individual output.
+
+Use it when you want:
+
+- a stronger pre-merge check than a single review pass
+- parallel pressure-testing from multiple engines
+- one job id that preserves both the consensus and each reviewer transcript
+
+Examples:
+
+```bash
+/cc:matrix-review
+/cc:matrix-review --engines codex,gemini,droid
+/cc:matrix-review --background look for rollback and data-loss risks
+```
+
+If you omit `--engines`, the command uses the current `/cc:policy` matrix-review engine set.
 
 ### `/cc:orchestrate`
 
@@ -128,7 +155,8 @@ Use it when you want:
 - a user-adjustable plan before any CLI starts running
 - a backgroundable workflow that still shows up in `/cc:status`, `/cc:result`, and `/cc:cancel`
 
-Default role mapping:
+When a step is not pinned to a specific engine, the workflow can now leave it as `auto` so the runtime policy chooses the engine at execution time.
+If a concrete fallback mapping is needed, the default is still:
 
 - Codex for implementation or rescue work
 - Gemini for adversarial review
@@ -171,6 +199,7 @@ Examples:
 
 ```bash
 /cc:rescue --engine codex investigate why the tests started failing
+/cc:rescue --engine auto investigate why the tests started failing
 /cc:rescue --engine codex --resume apply the top fix from the last run
 /cc:rescue --engine codex --model gpt-5.4-mini --effort medium investigate the flaky integration test
 /cc:rescue --engine gemini --background investigate the regression
@@ -187,8 +216,54 @@ Notes:
 
 - if you do not pass `--model` or `--effort`, the engine uses its normal defaults unless you saved defaults with `/cc:setup`
   Gemini is the exception for `--effort`: the plugin warns, ignores it, and also ignores any older saved Gemini effort value
+- if you enable `/cc:policy --prefer-auto`, `/cc:rescue` can auto-route even when you omit `--engine`
 - follow-up rescue requests can continue the latest engine task in the repo
 - if you do not specify `--wait` or `--background`, `/cc:rescue` defaults to foreground
+
+### `/cc:policy`
+
+Shows or updates the repo-local auto-routing policy.
+
+Use it when you want to:
+
+- make `review` and `rescue` default to `auto`
+- switch between `balanced`, `quality-first`, `speed-first`, and `cost-first`
+- change which engines participate in `matrix-review`
+
+Examples:
+
+```bash
+/cc:policy
+/cc:policy --prefer-auto
+/cc:policy --set quality-first --matrix-engines codex,gemini,droid
+```
+
+### `/cc:memory`
+
+Shows a lightweight repository-local memory built from prior `/cc` jobs.
+
+It summarizes:
+
+- recent success and failure history
+- which engines have performed best for `task`, `review`, and `adversarial-review`
+- how often auto routing chose each engine
+
+Example:
+
+```bash
+/cc:memory
+```
+
+### `/cc:replay`
+
+Shows the stored execution timeline and final output for a finished job.
+
+Examples:
+
+```bash
+/cc:replay
+/cc:replay task-abc123
+```
 
 ### `/cc:status`
 
@@ -270,7 +345,14 @@ When the review gate is enabled, Claude can run a targeted review before stoppin
 ### Hand A Problem To An Engine
 
 ```bash
-/cc:rescue --engine gemini investigate why the build is failing in CI
+/cc:policy --prefer-auto
+/cc:rescue investigate why the build is failing in CI
+```
+
+### Run A Consensus Review
+
+```bash
+/cc:matrix-review --background look for security and rollback issues
 ```
 
 ### Start Something Long-Running
@@ -307,3 +389,11 @@ Finished jobs can show a resume hint.
 
 - Codex jobs show `codex resume <thread-id>` when available
 - Gemini and Droid jobs point back to `/cc:rescue --engine <engine> --resume`
+
+### How does auto routing work?
+
+Use `/cc:policy` to pick a preset and enable or disable `prefer-auto` for the current repo.
+
+- `--engine auto` forces policy-based selection for a single `review` or `rescue`
+- `prefer-auto` makes `review` and `rescue` auto-route even when you omit `--engine`
+- `/cc:matrix-review` uses the configured matrix engine list when `--engines` is omitted

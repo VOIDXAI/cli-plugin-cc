@@ -72,12 +72,12 @@ export function buildReviewSchema() {
             title: { type: "string" },
             body: { type: "string" },
             file: { type: "string" },
-            line_start: { type: "integer" },
-            line_end: { type: "integer" },
-            confidence: { type: "number" },
+            line_start: { type: ["integer", "null"] },
+            line_end: { type: ["integer", "null"] },
+            confidence: { type: ["number", "null"] },
             recommendation: { type: "string" }
           },
-          required: ["severity", "title", "body", "file", "recommendation"]
+          required: ["severity", "title", "body", "file", "line_start", "line_end", "confidence", "recommendation"]
         }
       },
       next_steps: {
@@ -87,6 +87,20 @@ export function buildReviewSchema() {
     },
     required: ["verdict", "summary", "findings", "next_steps"]
   };
+}
+
+function normalizeVerdictLabel(value) {
+  const normalized = typeof value === "string" ? value.trim().toLowerCase() : "";
+  if (!normalized) {
+    return null;
+  }
+  if (["approve", "approved", "pass", "passed", "ok"].includes(normalized)) {
+    return "approve";
+  }
+  if (["needs-attention", "needs_attention", "block", "blocked", "reject", "rejected", "fail", "failed"].includes(normalized)) {
+    return "needs-attention";
+  }
+  return normalized;
 }
 
 export function buildGenericReviewPrompt(context, focusText) {
@@ -427,7 +441,7 @@ export function normalizeReviewPayload(payload) {
       : Array.isArray(payload.sub_findings)
         ? payload.sub_findings
         : null;
-  const verdict =
+  const explicitVerdict =
     typeof payload.verdict === "string"
       ? payload.verdict
       : typeof payload.decision === "string"
@@ -438,7 +452,16 @@ export function normalizeReviewPayload(payload) {
             ? payload.finding_type
             : typeof payload.overall_assessment === "string"
               ? payload.overall_assessment
+              : typeof payload.status === "string"
+                ? payload.status
+                : null;
+  const inferredVerdict =
+    Array.isArray(sourceFindings) && sourceFindings.length > 0
+      ? "needs-attention"
+      : Array.isArray(sourceFindings)
+        ? "approve"
         : null;
+  const verdict = normalizeVerdictLabel(explicitVerdict ?? inferredVerdict);
   if (!verdict || !sourceFindings) {
     return null;
   }

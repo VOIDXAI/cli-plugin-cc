@@ -1,6 +1,6 @@
 ---
-description: Run a steerable challenge review through Codex, Gemini, or Droid.
-argument-hint: '[--engine <codex|gemini|droid>] [--wait|--background] [--model <id>] [--effort none|minimal|low|medium|high|xhigh] [--base <ref>] [--scope auto|working-tree|branch] [focus ...]'
+description: Run a steerable challenge review through Codex, Gemini, or Droid, with optional auto routing.
+argument-hint: '[--engine <codex|gemini|droid|auto>] [--wait|--background] [--model <id>] [--effort none|minimal|low|medium|high|xhigh] [--base <ref>] [--scope auto|working-tree|branch] [focus ...]'
 disable-model-invocation: true
 allowed-tools: Bash, AskUserQuestion
 ---
@@ -34,6 +34,8 @@ Execution mode rules:
 Argument handling:
 - Preserve the user's arguments exactly.
 - Do not strip `--wait` or `--background` yourself.
+- `--engine auto` is valid and lets the runtime select the best ready engine from the current `/cc:policy`.
+- If the user omits `--engine` and `/cc:policy --prefer-auto` is enabled for this repo, the runtime may still auto-route the review.
 - `/cc:adversarial-review` uses the same review target selection as `/cc:review`.
 - It supports working-tree review, branch review, and `--base <ref>`.
 - It does not support `--scope staged` or `--scope unstaged`.

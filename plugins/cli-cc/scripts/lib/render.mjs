@@ -27,6 +27,46 @@ function formatLineRange(finding) {
   return `:${finding.line_start}-${finding.line_end}`;
 }
 
+function summarizeRoutingContext(routeContext) {
+  if (!routeContext || typeof routeContext !== "object") {
+    return null;
+  }
+  if (routeContext.targetMode) {
+    return `${routeContext.targetMode}, ${routeContext.changedFiles ?? 0} files, ${routeContext.totalLines ?? 0} changed lines`;
+  }
+  return null;
+}
+
+function buildRoutingLines(source) {
+  const lines = [];
+  const shouldShowRequestedEngine =
+    Boolean(source?.requestedEngine) &&
+    (source.requestedEngine === "auto" ||
+      source.engine !== source.requestedEngine ||
+      source.policyId != null ||
+      source.selectionReason != null);
+  if (shouldShowRequestedEngine) {
+    lines.push(`Requested engine: ${source.requestedEngine}`);
+  }
+  if (source?.engine && source.engine !== "multi" && source.engine !== source.requestedEngine) {
+    lines.push(`Selected engine: ${source.engine}`);
+  }
+  if (source?.policyId) {
+    lines.push(`Policy: ${source.policyId}`);
+  }
+  if (Array.isArray(source?.fallbackChain) && source.fallbackChain.length > 0) {
+    lines.push(`Fallbacks: ${source.fallbackChain.join(", ")}`);
+  }
+  const routeContextSummary = summarizeRoutingContext(source?.routeContext);
+  if (routeContextSummary) {
+    lines.push(`Route context: ${routeContextSummary}`);
+  }
+  if (source?.selectionReason) {
+    lines.push(`Why: ${source.selectionReason}`);
+  }
+  return lines;
+}
+
 function validateReviewResultShape(data) {
   if (!data || typeof data !== "object" || Array.isArray(data)) {
     return "Expected a top-level JSON object.";
@@ -260,6 +300,9 @@ function pushJobDetails(lines, job, options = {}) {
       lines.push(`    ${line}`);
     }
   }
+  for (const line of buildRoutingLines(job)) {
+    lines.push(`  ${line}`);
+  }
 }
 
 function appendReasoningSection(lines, reasoningSummary) {
@@ -270,6 +313,18 @@ function appendReasoningSection(lines, reasoningSummary) {
   lines.push("", "Reasoning:");
   for (const section of reasoningSummary) {
     lines.push(`- ${section}`);
+  }
+}
+
+function appendRoutingSection(lines, source) {
+  const routingLines = buildRoutingLines(source);
+  if (routingLines.length === 0) {
+    return;
+  }
+
+  lines.push("", "Routing:");
+  for (const line of routingLines) {
+    lines.push(`- ${line}`);
   }
 }
 
@@ -349,6 +404,78 @@ export function renderSetup(report) {
   return `${lines.join("\n").trimEnd()}\n`;
 }
 
+export function renderPolicyReport(report) {
+  const lines = [
+    "# cli-plugin-cc policy",
+    "",
+    `Auto routing by default: ${report.config.preferAutoRouting ? "enabled" : "disabled"}`,
+    `Active preset: ${report.preset.id} (${report.preset.label})`,
+    "",
+    report.preset.summary,
+    "",
+    `Matrix review engines: ${report.config.matrixReviewEngines.join(", ")}`,
+    `Large review threshold: ${report.config.largeReviewFileThreshold} files or ${report.config.largeReviewLineThreshold} changed lines`,
+    "",
+    "Available presets:"
+  ];
+
+  for (const preset of report.presets) {
+    lines.push(`- ${preset.id}: ${preset.summary}`);
+  }
+
+  return `${lines.join("\n").trimEnd()}\n`;
+}
+
+export function renderWorkspaceMemory(snapshot) {
+  const lines = [
+    "# cli-plugin-cc memory",
+    "",
+    `Jobs tracked: ${snapshot.totalJobs}`,
+    `Finished jobs: ${snapshot.finishedJobs}`,
+    `Completed: ${snapshot.completedJobs}`,
+    `Failed: ${snapshot.failedJobs}`,
+    `Cancelled: ${snapshot.cancelledJobs}`
+  ];
+
+  const recommendationEntries = [
+    ["task", snapshot.recommendations.task],
+    ["review", snapshot.recommendations.review],
+    ["adversarial-review", snapshot.recommendations.adversarialReview]
+  ].filter(([, recommendation]) => recommendation);
+
+  if (recommendationEntries.length > 0) {
+    lines.push("", "Recommended engines:");
+    for (const [jobClass, recommendation] of recommendationEntries) {
+      lines.push(
+        `- ${jobClass}: ${recommendation.engine} (${recommendation.successRate}% success over ${recommendation.total} finished run(s))`
+      );
+    }
+  }
+
+  if (Array.isArray(snapshot.autoRoutingHistory) && snapshot.autoRoutingHistory.length > 0) {
+    lines.push("", "Auto-routing history:");
+    for (const entry of snapshot.autoRoutingHistory) {
+      lines.push(`- ${entry.engine}: selected ${entry.count} time(s)`);
+    }
+  }
+
+  if (Array.isArray(snapshot.recentSuccesses) && snapshot.recentSuccesses.length > 0) {
+    lines.push("", "Recent successes:");
+    for (const job of snapshot.recentSuccesses) {
+      lines.push(`- ${job.id} (${job.jobClass} via ${job.engine}): ${job.summary ?? job.title ?? "completed"}`);
+    }
+  }
+
+  if (Array.isArray(snapshot.recentFailures) && snapshot.recentFailures.length > 0) {
+    lines.push("", "Recent failures:");
+    for (const job of snapshot.recentFailures) {
+      lines.push(`- ${job.id} (${job.jobClass} via ${job.engine}): ${job.summary ?? job.title ?? "failed"}`);
+    }
+  }
+
+  return `${lines.join("\n").trimEnd()}\n`;
+}
+
 export function renderReview(result, job) {
   const parsedResult = {
     parsed: result.structured ?? null,
@@ -365,7 +492,12 @@ export function renderReview(result, job) {
     sessionRef: result.sessionRef ?? null,
     turnId: result.turnId ?? null,
     rawFallback: result.finalText ?? "",
-    ok: result.ok
+    ok: result.ok,
+    requestedEngine: job.requestedEngine ?? job.engine,
+    policyId: job.policyId ?? null,
+    selectionReason: job.selectionReason ?? null,
+    fallbackChain: job.fallbackChain ?? [],
+    routeContext: job.routeContext ?? null
   });
 }
 
@@ -393,6 +525,7 @@ export function renderReviewResult(parsedResult, meta) {
     }
 
     appendReasoningSection(lines, meta.reasoningSummary ?? parsedResult.reasoningSummary);
+    appendRoutingSection(lines, meta);
     appendSession(lines, {
       threadId: meta.threadId ?? null,
       sessionRef: meta.sessionRef ?? null,
@@ -408,6 +541,7 @@ export function renderReviewResult(parsedResult, meta) {
       lines.push("", "Raw final message:", "", "```text", parsedResult.rawOutput, "```");
     }
     appendReasoningSection(lines, meta.reasoningSummary ?? parsedResult.reasoningSummary);
+    appendRoutingSection(lines, meta);
     appendSession(lines, {
       threadId: meta.threadId ?? null,
       sessionRef: meta.sessionRef ?? null,
@@ -441,6 +575,7 @@ export function renderReviewResult(parsedResult, meta) {
   }
 
   appendReasoningSection(lines, meta.reasoningSummary ?? parsedResult.reasoningSummary);
+  appendRoutingSection(lines, meta);
   appendSession(lines, {
     threadId: meta.threadId ?? null,
     sessionRef: meta.sessionRef ?? null,
@@ -459,12 +594,116 @@ export function renderTaskResult(result, job) {
     lines.push("", `Permission: ${permissionSummary}`);
   }
   appendReasoningSection(lines, result.reasoningSummary ?? []);
+  appendRoutingSection(lines, job);
   appendSession(lines, result);
 
   if (Array.isArray(result.touchedFiles) && result.touchedFiles.length > 0) {
     lines.push("", "Touched files:");
     for (const file of result.touchedFiles) {
       lines.push(`- ${file}`);
+    }
+  }
+
+  return `${lines.join("\n").trimEnd()}\n`;
+}
+
+function normalizeMatrixReviewer(reviewer, index) {
+  const source = reviewer && typeof reviewer === "object" && !Array.isArray(reviewer) ? reviewer : {};
+  return {
+    index: Number.isInteger(source.index) ? source.index : index + 1,
+    id: source.id ?? `reviewer-${index + 1}`,
+    engine: source.engine ?? "unknown",
+    status: source.status ?? "unknown",
+    phase: source.phase ?? "",
+    verdict: source.verdict ?? null,
+    summary: source.summary ?? "",
+    rendered: source.rendered ?? "",
+    threadId: source.threadId ?? null,
+    sessionRef: source.sessionRef ?? null
+  };
+}
+
+function appendMatrixReviewersTable(lines, reviewers) {
+  const normalized = Array.isArray(reviewers) ? reviewers.map((reviewer, index) => normalizeMatrixReviewer(reviewer, index)) : [];
+  if (normalized.length === 0) {
+    return;
+  }
+
+  lines.push("", "Reviewers:");
+  lines.push("| Reviewer | Engine | Status | Verdict | Session ID | Summary |");
+  lines.push("| --- | --- | --- | --- | --- | --- |");
+  for (const reviewer of normalized) {
+    lines.push(
+      `| ${escapeMarkdownCell(reviewer.index)} | ${escapeMarkdownCell(reviewer.engine)} | ${escapeMarkdownCell(reviewer.status)} | ${escapeMarkdownCell(reviewer.verdict ?? "")} | ${escapeMarkdownCell(reviewer.threadId ?? reviewer.sessionRef ?? "")} | ${escapeMarkdownCell(reviewer.summary)} |`
+    );
+  }
+}
+
+function renderMatrixFinding(finding, index) {
+  const normalized = normalizeReviewFinding(finding, index);
+  const engines = Array.isArray(finding?.engines) ? finding.engines.filter(Boolean) : [];
+  return {
+    ...normalized,
+    engines
+  };
+}
+
+export function renderMatrixReviewResult(job, storedJob = null) {
+  const source = storedJob ?? job ?? {};
+  const consensus = source.consensus ?? source.result?.consensus ?? null;
+  const reviewers = Array.isArray(source.reviewers) ? source.reviewers : [];
+  const lines = ["# Matrix Review", ""];
+
+  if (source.reviewKind) {
+    lines.push(`Kind: ${source.reviewKind}`);
+  }
+  if (source.targetLabel) {
+    lines.push(`Target: ${source.targetLabel}`);
+  }
+  if (consensus?.verdict) {
+    lines.push(`Consensus: ${consensus.verdict}`);
+  }
+  if (consensus?.summary) {
+    lines.push("", consensus.summary);
+  }
+
+  appendRoutingSection(lines, source);
+  appendMatrixReviewersTable(lines, reviewers);
+
+  if (Array.isArray(consensus?.findings) && consensus.findings.length > 0) {
+    lines.push("", "Consensus findings:");
+    for (const [index, finding] of consensus.findings.entries()) {
+      const normalized = renderMatrixFinding(finding, index);
+      const reportedBy = normalized.engines.length > 0 ? ` [reported by ${normalized.engines.join(", ")}]` : "";
+      lines.push(
+        `- [${normalized.severity}] ${normalized.title} (${normalized.file}${formatLineRange(normalized)})${reportedBy}`
+      );
+      lines.push(`  ${normalized.body}`);
+      if (normalized.recommendation) {
+        lines.push(`  Recommendation: ${normalized.recommendation}`);
+      }
+    }
+  }
+
+  if (Array.isArray(consensus?.disagreements) && consensus.disagreements.length > 0) {
+    lines.push("", "Disagreements:");
+    for (const disagreement of consensus.disagreements) {
+      lines.push(`- ${disagreement}`);
+    }
+  }
+
+  for (const [index, reviewer] of reviewers.entries()) {
+    const normalized = normalizeMatrixReviewer(reviewer, index);
+    lines.push("", `## Reviewer ${normalized.index}: ${normalized.engine}`, "");
+    lines.push(`- Status: ${normalized.status}`);
+    if (normalized.verdict) {
+      lines.push(`- Verdict: ${normalized.verdict}`);
+    }
+    if (normalized.summary) {
+      lines.push(`- Summary: ${normalized.summary}`);
+    }
+    if (normalized.rendered) {
+      lines.push("", normalized.rendered.trimEnd());
     }
   }
 
@@ -520,6 +759,8 @@ export function renderJobStatusReport(job) {
   });
   if (job.jobClass === "orchestrate") {
     appendWorkflowStepsTable(lines, job.steps ?? []);
+  } else if (job.jobClass === "matrix-review") {
+    appendMatrixReviewersTable(lines, job.reviewers ?? []);
   }
   return `${lines.join("\n").trimEnd()}\n`;
 }
@@ -527,6 +768,9 @@ export function renderJobStatusReport(job) {
 export function renderStoredJobResult(job, storedJob) {
   if (job?.jobClass === "orchestrate" || storedJob?.jobClass === "orchestrate") {
     return renderOrchestrationStoredJobResult(job, storedJob);
+  }
+  if (job?.jobClass === "matrix-review" || storedJob?.jobClass === "matrix-review") {
+    return renderMatrixReviewResult(job, storedJob);
   }
   const threadId = storedJob?.threadId ?? job.threadId ?? job.ownerState?.threadId ?? null;
   const sessionRef = storedJob?.sessionRef ?? job.sessionRef ?? job.ownerState?.sessionRef ?? null;
@@ -538,6 +782,7 @@ export function renderStoredJobResult(job, storedJob) {
   if (storedJob?.rendered) {
     const output = storedJob.rendered.endsWith("\n") ? storedJob.rendered : `${storedJob.rendered}\n`;
     const lines = [output.trimEnd()];
+    appendRoutingSection(lines, storedJob ?? job);
     if (threadId || sessionRef) {
       lines.push("", `Session ID: ${threadId ?? sessionRef}`);
     }
@@ -564,7 +809,12 @@ export function renderStoredJobResult(job, storedJob) {
         threadId,
         sessionRef,
         turnId: storedJob.turnId ?? job.turnId ?? null,
-        ok: job.status === "completed"
+        ok: job.status === "completed",
+        requestedEngine: storedJob.requestedEngine ?? job.requestedEngine ?? job.engine,
+        policyId: storedJob.policyId ?? job.policyId ?? null,
+        selectionReason: storedJob.selectionReason ?? job.selectionReason ?? null,
+        fallbackChain: storedJob.fallbackChain ?? job.fallbackChain ?? [],
+        routeContext: storedJob.routeContext ?? job.routeContext ?? null
       }
     );
     return rendered;
@@ -580,6 +830,7 @@ export function renderStoredJobResult(job, storedJob) {
     if (permissionSummary) {
       lines.push("", `Permission: ${permissionSummary}`);
     }
+    appendRoutingSection(lines, storedJob ?? job);
     if (threadId || sessionRef) {
       lines.push("", `Session ID: ${threadId ?? sessionRef}`);
     }
@@ -604,6 +855,10 @@ export function renderStoredJobResult(job, storedJob) {
   }
   if (job.summary) {
     lines.push(`Summary: ${job.summary}`);
+  }
+  const routingLines = buildRoutingLines(storedJob ?? job);
+  for (const line of routingLines) {
+    lines.push(line);
   }
 
   if (job.errorMessage) {

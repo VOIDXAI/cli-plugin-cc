@@ -51,6 +51,9 @@ function getJobTypeLabel(job) {
   if (job.jobClass === "orchestrate") {
     return "orchestrate";
   }
+  if (job.jobClass === "matrix-review") {
+    return "matrix-review";
+  }
   return "job";
 }
 

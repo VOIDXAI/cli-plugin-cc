@@ -4,6 +4,7 @@ export const WORKFLOW_PLAN_VERSION = 1;
 export const MAX_WORKFLOW_STEPS = 5;
 export const WORKFLOW_STEP_KINDS = new Set(["task", "review", "adversarial-review"]);
 export const WORKFLOW_ASSIGNMENT_SOURCES = new Set(["auto", "manual"]);
+export const WORKFLOW_AUTO_ENGINE = "auto";
 
 const STEP_OPTION_KEYS = {
   task: new Set(["model", "effort", "permission"]),
@@ -153,7 +154,7 @@ export function normalizeWorkflowPlan(source, options = {}) {
     seenIds.add(id);
 
     const engine = normalizeNonEmptyString(rawStep.engine, `steps[${index}].engine`);
-    if (supportedEngines.size > 0 && !supportedEngines.has(engine)) {
+    if (engine !== WORKFLOW_AUTO_ENGINE && supportedEngines.size > 0 && !supportedEngines.has(engine)) {
       throw new Error(`steps[${index}].engine "${engine}" is not supported.`);
     }
 

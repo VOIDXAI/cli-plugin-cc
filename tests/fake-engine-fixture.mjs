@@ -382,7 +382,32 @@ async function main() {
 
   let response = "Gemini completed task.";
   if (prompt.includes("Return only valid JSON")) {
-    if (process.env.FAKE_GEMINI_OVERALL_ASSESSMENT_REVIEW === "1") {
+    if (process.env.FAKE_GEMINI_FINDINGS_ONLY_REVIEW === "1") {
+      const fence = String.fromCharCode(96).repeat(3);
+      response = [
+        fence + "json",
+        JSON.stringify(
+          {
+            findings: [
+              {
+                file: "src/app.js",
+                line_start: 2,
+                line_end: 3,
+                confidence: 0.85,
+                summary:
+                  "The modification changes the exported function from throwing on invalid input to silently returning null, which can hide broken callers.",
+                recommendation:
+                  "Either preserve the old contract or update all callers to explicitly handle null results.",
+                needs_attention: true
+              }
+            ]
+          },
+          null,
+          2
+        ),
+        fence
+      ].join("\\n");
+    } else if (process.env.FAKE_GEMINI_OVERALL_ASSESSMENT_REVIEW === "1") {
       const fence = String.fromCharCode(96).repeat(3);
       response = [
         fence + "json",
@@ -560,7 +585,13 @@ async function main() {
   let response = "Droid completed task.";
   if (prompt.includes("Return only valid JSON")) {
     response = JSON.stringify(
-      process.env.FAKE_DROID_DECISION_ONLY === "1"
+      process.env.FAKE_DROID_STATUS_REVIEW === "1"
+        ? {
+            status: "approve",
+            summary: "Droid status-mode review found no material issues.",
+            findings: []
+          }
+        : process.env.FAKE_DROID_DECISION_ONLY === "1"
         ? {
             decision: "needs-attention",
             summary: "Droid decision-mode review found one issue.",

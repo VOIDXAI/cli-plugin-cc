@@ -79,6 +79,42 @@ function collectBranchContext(cwd, baseRef) {
   };
 }
 
+function parseDiffShortStat(text) {
+  const normalized = String(text ?? "").trim();
+  if (!normalized) {
+    return {
+      files: 0,
+      additions: 0,
+      deletions: 0
+    };
+  }
+
+  const files = Number.parseInt(normalized.match(/(\d+)\s+files?\s+changed/)?.[1] ?? "0", 10) || 0;
+  const additions = Number.parseInt(normalized.match(/(\d+)\s+insertions?\(\+\)/)?.[1] ?? "0", 10) || 0;
+  const deletions = Number.parseInt(normalized.match(/(\d+)\s+deletions?\(-\)/)?.[1] ?? "0", 10) || 0;
+
+  return {
+    files,
+    additions,
+    deletions
+  };
+}
+
+function combineDiffStats(...stats) {
+  return stats.reduce(
+    (combined, entry) => ({
+      files: combined.files + (entry?.files ?? 0),
+      additions: combined.additions + (entry?.additions ?? 0),
+      deletions: combined.deletions + (entry?.deletions ?? 0)
+    }),
+    {
+      files: 0,
+      additions: 0,
+      deletions: 0
+    }
+  );
+}
+
 export function ensureGitRepository(cwd) {
   const result = git(cwd, ["rev-parse", "--show-toplevel"]);
   const errorCode = result.error && "code" in result.error ? result.error.code : null;
@@ -206,5 +242,38 @@ export function collectReviewContext(cwd, target) {
     branch: currentBranch,
     target,
     ...details
+  };
+}
+
+export function summarizeReviewTarget(cwd, options = {}) {
+  const repoRoot = getRepoRoot(cwd);
+  const target = resolveReviewTarget(repoRoot, options);
+
+  if (target.mode === "working-tree") {
+    const state = getWorkingTreeState(repoRoot);
+    const changedFiles = new Set([...state.staged, ...state.unstaged, ...state.untracked]).size;
+    const staged = parseDiffShortStat(gitChecked(repoRoot, ["diff", "--cached", "--shortstat"]).stdout);
+    const unstaged = parseDiffShortStat(gitChecked(repoRoot, ["diff", "--shortstat"]).stdout);
+    const combined = combineDiffStats(staged, unstaged);
+    return {
+      target,
+      repoRoot,
+      changedFiles,
+      additions: combined.additions,
+      deletions: combined.deletions,
+      totalLines: combined.additions + combined.deletions
+    };
+  }
+
+  const mergeBase = gitChecked(repoRoot, ["merge-base", "HEAD", target.baseRef]).stdout.trim();
+  const commitRange = `${mergeBase}..HEAD`;
+  const diff = parseDiffShortStat(gitChecked(repoRoot, ["diff", "--shortstat", commitRange]).stdout);
+  return {
+    target,
+    repoRoot,
+    changedFiles: diff.files,
+    additions: diff.additions,
+    deletions: diff.deletions,
+    totalLines: diff.additions + diff.deletions
   };
 }

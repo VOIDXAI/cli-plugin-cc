@@ -4,6 +4,7 @@ import {
   codexReviewSandbox,
   codexTaskSandbox,
   ENGINE_INFO,
+  normalizeReviewPayload,
   resolveReviewRequest
 } from "./shared.mjs";
 import {
@@ -83,6 +84,7 @@ async function runReviewInternal({ kind, cwd, scope, baseRef, focusText, model, 
     onProgress
   });
   const parsed = parseStructuredOutput(result.finalMessage, {
+    failureMessage: result.error?.message ?? result.stderr ?? null,
     reasoningSummary: result.reasoningSummary
   });
   return {
@@ -102,7 +104,7 @@ function normalizeStructuredReview(parsed) {
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
     return null;
   }
-  return parsed;
+  return normalizeReviewPayload(parsed) ?? parsed;
 }
 
 async function runTaskInternal({ cwd, prompt, model, effort, readOnly = false, permission = null, onProgress }) {
