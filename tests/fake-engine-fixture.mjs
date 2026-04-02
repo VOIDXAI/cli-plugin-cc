@@ -382,7 +382,79 @@ async function main() {
 
   let response = "Gemini completed task.";
   if (prompt.includes("Return only valid JSON")) {
-    if (process.env.FAKE_GEMINI_FENCED_REVIEW === "1") {
+    if (process.env.FAKE_GEMINI_OVERALL_ASSESSMENT_REVIEW === "1") {
+      const fence = String.fromCharCode(96).repeat(3);
+      response = [
+        fence + "json",
+        JSON.stringify(
+          {
+            findings: [
+              {
+                affected_file: "src/app.js",
+                line_start: 1,
+                line_end: 3,
+                confidence: 1,
+                summary: "The prior review found the semantic inversion, but it understated the silent corruption risk to downstream callers.",
+                recommendation: "Restore addition semantics or force an explicit API rename and caller migration."
+              }
+            ],
+            overall_assessment: "needs-attention"
+          },
+          null,
+          2
+        ),
+        fence
+      ].join("\\n");
+    } else if (process.env.FAKE_GEMINI_FINDING_TYPE_REVIEW === "1") {
+      const fence = String.fromCharCode(96).repeat(3);
+      response = [
+        fence + "json",
+        JSON.stringify(
+          {
+            finding_type: "needs-attention",
+            summary: "This change introduces a critical, silent API contract violation that should not ship.",
+            findings: [
+              {
+                file: "src/app.js",
+                line_start: 2,
+                line_end: 2,
+                confidence: 1,
+                description:
+                  "Changing an exported sum helper from addition to subtraction silently breaks callers and corrupts downstream results.",
+                recommendation: "Restore addition semantics or rename the API and update every caller."
+              }
+            ]
+          },
+          null,
+          2
+        ),
+        fence
+      ].join("\\n");
+    } else if (process.env.FAKE_GEMINI_OUTCOME_REVIEW === "1") {
+      const fence = String.fromCharCode(96).repeat(3);
+      response = [
+        fence + "json",
+        JSON.stringify(
+          {
+            outcome: "needs-attention",
+            summary: "Prior review found the right regression, but it understates the silent corruption risk.",
+            findings: [
+              {
+                affected_file: "src/app.js",
+                line_start: 2,
+                line_end: 4,
+                confidence: 0.98,
+                recommendation:
+                  "Call out that changing addition to subtraction silently corrupts results for every caller until the behavior is restored."
+              }
+            ]
+          },
+          null,
+          2
+        ),
+        fence
+      ].join("\\n");
+    } else if (process.env.FAKE_GEMINI_FENCED_REVIEW === "1") {
       const fence = String.fromCharCode(96).repeat(3);
       response = [
         fence + "json",

@@ -49,6 +49,12 @@ function readJsonLines(filePath) {
     .map((line) => JSON.parse(line));
 }
 
+function writePlanFile(plan) {
+  const filePath = path.join(makeTempDir(), "workflow-plan.json");
+  fs.writeFileSync(filePath, `${JSON.stringify(plan, null, 2)}\n`, "utf8");
+  return filePath;
+}
+
 function findEvents(state, type) {
   return (state.events ?? []).filter((entry) => entry.type === type);
 }
@@ -629,6 +635,295 @@ test("invalid effort values are rejected before the engine starts", () => {
   assert.match(result.stderr, /Unsupported reasoning effort "ultra"/);
 });
 
+test("orchestrate validates workflow plans before any engine starts", () => {
+  const binDir = makeTempDir();
+  const dataDir = makeTempDir();
+  installFakeEngines(binDir);
+  const repoDir = makeRepo();
+  const planFile = writePlanFile({
+    version: 1,
+    title: "Bad review workflow",
+    task: "Review the current changes",
+    steps: [
+      {
+        id: "review-now",
+        title: "Review now",
+        engine: "codex",
+        assignmentSource: "auto",
+        kind: "review",
+        input: "this should not be allowed",
+        options: {}
+      }
+    ]
+  });
+
+  const result = run(process.execPath, [SCRIPT, "orchestrate", "--plan-file", planFile], {
+    cwd: repoDir,
+    env: envFor(binDir, dataDir)
+  });
+
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /input is not supported for review steps/i);
+});
+
+test("orchestrate rejects step references that point to future steps", () => {
+  const binDir = makeTempDir();
+  const dataDir = makeTempDir();
+  installFakeEngines(binDir);
+  const repoDir = makeRepo();
+  const planFile = writePlanFile({
+    version: 1,
+    title: "Bad reference workflow",
+    task: "Fix the issue",
+    steps: [
+      {
+        id: "implement",
+        title: "Implement",
+        engine: "codex",
+        assignmentSource: "auto",
+        kind: "task",
+        input: "Use {{step_summary:final-review}} first.",
+        options: {}
+      },
+      {
+        id: "final-review",
+        title: "Final review",
+        engine: "droid",
+        assignmentSource: "auto",
+        kind: "review",
+        input: null,
+        options: {}
+      }
+    ]
+  });
+
+  const result = run(process.execPath, [SCRIPT, "orchestrate", "--plan-file", planFile], {
+    cwd: repoDir,
+    env: envFor(binDir, dataDir)
+  });
+
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /references "step_summary:final-review" before step "final-review" is available/i);
+});
+
+test("orchestrate executes a foreground multi-step workflow and preserves manual engine assignments", () => {
+  const binDir = makeTempDir();
+  const dataDir = makeTempDir();
+  const fixtures = installFakeEngines(binDir);
+  const repoDir = makeRepo();
+  const planFile = writePlanFile({
+    version: 1,
+    title: "Implement, challenge, review",
+    task: "Fix the regression safely",
+    steps: [
+      {
+        id: "implement",
+        title: "Implement the fix",
+        engine: "codex",
+        assignmentSource: "manual",
+        kind: "task",
+        input: "{{workflow_task}}",
+        options: {
+          model: "gpt-5.4",
+          permission: "full"
+        }
+      },
+      {
+        id: "challenge",
+        title: "Challenge the fix",
+        engine: "gemini",
+        assignmentSource: "manual",
+        kind: "adversarial-review",
+        input: "Question this result: {{step_summary:implement}}",
+        options: {
+          model: "gemini-2.5-pro"
+        }
+      },
+      {
+        id: "final-review",
+        title: "Final review",
+        engine: "droid",
+        assignmentSource: "auto",
+        kind: "review",
+        input: null,
+        options: {
+          model: "gpt-5.4"
+        }
+      }
+    ]
+  });
+
+  const result = run(process.execPath, [SCRIPT, "orchestrate", "--plan-file", planFile], {
+    cwd: repoDir,
+    env: envFor(binDir, dataDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /# Orchestration Result/);
+  assert.match(result.stdout, /\| 1\. Implement the fix \| task \| codex \| manual \| completed \|/);
+  assert.match(result.stdout, /\| 2\. Challenge the fix \| adversarial-review \| gemini \| manual \| completed \|/);
+  assert.match(result.stdout, /\| 3\. Final review \| review \| droid \| auto \| completed \|/);
+  assert.match(result.stdout, /# Rescue Result \(codex\)/);
+  assert.match(result.stdout, /# Adversarial Review \(gemini\)/);
+  assert.match(result.stdout, /# Review \(droid\)/);
+
+  const codexState = readJson(fixtures.codexStatePath);
+  const codexTurn = lastValue(findEvents(codexState, "turn/start"));
+  assert.match(codexTurn?.payload?.prompt ?? "", /Fix the regression safely/);
+
+  const geminiLog = readJsonLines(fixtures.geminiLogPath);
+  assert.equal(geminiLog.length, 1);
+  assert.match(geminiLog[0].args.join(" "), /Question this result: Handled the requested task\./);
+
+  const droidLog = readJsonLines(fixtures.droidLogPath);
+  assert.equal(droidLog.length, 1);
+  assert.match(droidLog[0].args.join(" "), /--output-format stream-json/);
+});
+
+test("orchestrate normalizes gemini outcome-style summaries for workflow steps", () => {
+  const binDir = makeTempDir();
+  const dataDir = makeTempDir();
+  installFakeEngines(binDir);
+  const repoDir = makeRepo();
+  const planFile = writePlanFile({
+    version: 1,
+    title: "Outcome-style gemini review",
+    task: "Fix the regression safely",
+    steps: [
+      {
+        id: "implement",
+        title: "Implement the fix",
+        engine: "codex",
+        assignmentSource: "manual",
+        kind: "task",
+        input: "{{workflow_task}}",
+        options: {}
+      },
+      {
+        id: "challenge",
+        title: "Challenge the fix",
+        engine: "gemini",
+        assignmentSource: "manual",
+        kind: "adversarial-review",
+        input: "Question this result: {{step_summary:implement}}",
+        options: {
+          model: "gemini-2.5-flash"
+        }
+      }
+    ]
+  });
+
+  const result = run(process.execPath, [SCRIPT, "orchestrate", "--plan-file", planFile], {
+    cwd: repoDir,
+    env: {
+      ...envFor(binDir, dataDir),
+      FAKE_GEMINI_OUTCOME_REVIEW: "1"
+    }
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /\| 2\. Challenge the fix \| adversarial-review \| gemini \| manual \| completed \| Prior review found the right regression, but it understates the silent corruption risk\./);
+  assert.doesNotMatch(result.stdout, /\| 2\. Challenge the fix \| adversarial-review \| gemini \| manual \| completed \| ```json/);
+  assert.match(result.stdout, /# Adversarial Review \(gemini\)[\s\S]*Verdict: needs-attention/);
+  assert.match(result.stdout, /Issue in src\/app\.js/);
+});
+
+test("orchestrate normalizes gemini finding-type summaries for workflow steps", () => {
+  const binDir = makeTempDir();
+  const dataDir = makeTempDir();
+  installFakeEngines(binDir);
+  const repoDir = makeRepo();
+  const planFile = writePlanFile({
+    version: 1,
+    title: "Finding-type gemini review",
+    task: "Fix the regression safely",
+    steps: [
+      {
+        id: "implement",
+        title: "Implement the fix",
+        engine: "codex",
+        assignmentSource: "manual",
+        kind: "task",
+        input: "{{workflow_task}}",
+        options: {}
+      },
+      {
+        id: "challenge",
+        title: "Challenge the fix",
+        engine: "gemini",
+        assignmentSource: "manual",
+        kind: "adversarial-review",
+        input: "Question this result: {{step_summary:implement}}",
+        options: {
+          model: "gemini-2.5-flash"
+        }
+      }
+    ]
+  });
+
+  const result = run(process.execPath, [SCRIPT, "orchestrate", "--plan-file", planFile], {
+    cwd: repoDir,
+    env: {
+      ...envFor(binDir, dataDir),
+      FAKE_GEMINI_FINDING_TYPE_REVIEW: "1"
+    }
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /\| 2\. Challenge the fix \| adversarial-review \| gemini \| manual \| completed \| This change introduces a critical, silent API contract violation that should not ship\./);
+  assert.doesNotMatch(result.stdout, /\| 2\. Challenge the fix \| adversarial-review \| gemini \| manual \| completed \| ```json/);
+  assert.match(result.stdout, /# Adversarial Review \(gemini\)[\s\S]*Verdict: needs-attention/);
+  assert.match(result.stdout, /Changing an exported sum helper from addition to subtraction silently breaks callers/);
+});
+
+test("orchestrate normalizes gemini overall-assessment summaries for workflow steps", () => {
+  const binDir = makeTempDir();
+  const dataDir = makeTempDir();
+  installFakeEngines(binDir);
+  const repoDir = makeRepo();
+  const planFile = writePlanFile({
+    version: 1,
+    title: "Overall-assessment gemini review",
+    task: "Fix the regression safely",
+    steps: [
+      {
+        id: "implement",
+        title: "Implement the fix",
+        engine: "codex",
+        assignmentSource: "manual",
+        kind: "task",
+        input: "{{workflow_task}}",
+        options: {}
+      },
+      {
+        id: "challenge",
+        title: "Challenge the fix",
+        engine: "gemini",
+        assignmentSource: "manual",
+        kind: "adversarial-review",
+        input: "Question this result: {{step_summary:implement}}",
+        options: {
+          model: "gemini-2.5-flash"
+        }
+      }
+    ]
+  });
+
+  const result = run(process.execPath, [SCRIPT, "orchestrate", "--plan-file", planFile], {
+    cwd: repoDir,
+    env: {
+      ...envFor(binDir, dataDir),
+      FAKE_GEMINI_OVERALL_ASSESSMENT_REVIEW: "1"
+    }
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /\| 2\. Challenge the fix \| adversarial-review \| gemini \| manual \| completed \| The prior review found the semantic inversion, but it understated the silent corruption risk to downstream callers\./);
+  assert.doesNotMatch(result.stdout, /\| 2\. Challenge the fix \| adversarial-review \| gemini \| manual \| completed \| ```json/);
+  assert.match(result.stdout, /# Adversarial Review \(gemini\)[\s\S]*Verdict: needs-attention/);
+  assert.match(result.stdout, /Issue in src\/app\.js/);
+});
+
 test("codex native review no longer falls back to a prompt review", () => {
   const binDir = makeTempDir();
   const dataDir = makeTempDir();
@@ -771,6 +1066,100 @@ test("background rescue job supports status and result", async () => {
   assert.match(result.stdout, /Permission: full \(effective: sandbox=danger-full-access\)/);
   assert.match(result.stdout, /Session ID: thr_/);
   assert.match(result.stdout, /Resume: codex resume thr_/);
+});
+
+test("background orchestration workflow supports status and result", async () => {
+  const binDir = makeTempDir();
+  const dataDir = makeTempDir();
+  installFakeEngines(binDir);
+  const repoDir = makeRepo();
+  const planFile = writePlanFile({
+    version: 1,
+    title: "Background workflow",
+    task: "Fix the bug",
+    steps: [
+      {
+        id: "implement",
+        title: "Implement the fix",
+        engine: "codex",
+        assignmentSource: "auto",
+        kind: "task",
+        input: "{{workflow_task}}",
+        options: {
+          model: "gpt-5.4"
+        }
+      }
+    ]
+  });
+
+  const start = run(process.execPath, [SCRIPT, "orchestrate", "--plan-file", planFile, "--background"], {
+    cwd: repoDir,
+    env: {
+      ...envFor(binDir, dataDir),
+      FAKE_ENGINE_DELAY_MS: "1200"
+    }
+  });
+
+  assert.equal(start.status, 0, start.stderr);
+  const match = start.stdout.match(/Started (orchestrate-[^) ]+)/);
+  assert.ok(match, start.stdout);
+  const jobId = match[1];
+
+  await waitFor(() => {
+    const status = run(process.execPath, [SCRIPT, "status", jobId, "--json"], {
+      cwd: repoDir,
+      env: {
+        ...envFor(binDir, dataDir),
+        FAKE_ENGINE_DELAY_MS: "1200"
+      }
+    });
+    if (status.status !== 0) {
+      return false;
+    }
+    const parsed = JSON.parse(status.stdout);
+    return parsed.job.jobClass === "orchestrate" && parsed.job.steps?.[0]?.status === "running";
+  }, 2500);
+
+  const runningStatus = run(process.execPath, [SCRIPT, "status", jobId], {
+    cwd: repoDir,
+    env: {
+      ...envFor(binDir, dataDir),
+      FAKE_ENGINE_DELAY_MS: "1200"
+    }
+  });
+  assert.equal(runningStatus.status, 0, runningStatus.stderr);
+  assert.match(runningStatus.stdout, /Current step: 1\/1/);
+  assert.match(runningStatus.stdout, /\| 1\. Implement the fix \| task \| codex \| auto \| running \|/);
+
+  const earlyResult = run(process.execPath, [SCRIPT, "result", jobId], {
+    cwd: repoDir,
+    env: {
+      ...envFor(binDir, dataDir),
+      FAKE_ENGINE_DELAY_MS: "1200"
+    }
+  });
+  assert.equal(earlyResult.status, 1);
+  assert.match(earlyResult.stderr, /is still (queued|running)/);
+
+  await waitFor(() => {
+    const status = run(process.execPath, [SCRIPT, "status", jobId, "--json"], {
+      cwd: repoDir,
+      env: {
+        ...envFor(binDir, dataDir),
+        FAKE_ENGINE_DELAY_MS: "1200"
+      }
+    });
+    return status.status === 0 && /"completed"/.test(status.stdout);
+  }, 4000);
+
+  const result = run(process.execPath, [SCRIPT, "result", jobId], {
+    cwd: repoDir,
+    env: envFor(binDir, dataDir)
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /# Orchestration Result/);
+  assert.match(result.stdout, /Workflow: Background workflow/);
+  assert.match(result.stdout, /\| 1\. Implement the fix \| task \| codex \| auto \| completed \|/);
 });
 
 test("droid background status surfaces session id before completion when stream init arrives early", async () => {
@@ -1070,5 +1459,74 @@ test("cancel marks a running job as cancelled", async () => {
       env: envFor(binDir, dataDir)
     });
     return /cancelled/.test(status.stdout);
+  });
+});
+
+test("cancel marks a running orchestration workflow and its active step as cancelled", async () => {
+  const binDir = makeTempDir();
+  const dataDir = makeTempDir();
+  installFakeEngines(binDir);
+  const repoDir = makeRepo();
+  const planFile = writePlanFile({
+    version: 1,
+    title: "Cancelable workflow",
+    task: "Fix the bug",
+    steps: [
+      {
+        id: "implement",
+        title: "Implement the fix",
+        engine: "codex",
+        assignmentSource: "auto",
+        kind: "task",
+        input: "{{workflow_task}}",
+        options: {}
+      }
+    ]
+  });
+
+  const start = run(process.execPath, [SCRIPT, "orchestrate", "--plan-file", planFile, "--background"], {
+    cwd: repoDir,
+    env: {
+      ...envFor(binDir, dataDir),
+      FAKE_ENGINE_DELAY_MS: "1500"
+    }
+  });
+
+  const match = start.stdout.match(/Started (orchestrate-[^) ]+)/);
+  assert.ok(match, start.stdout);
+  const jobId = match[1];
+
+  await waitFor(() => {
+    const status = run(process.execPath, [SCRIPT, "status", jobId, "--json"], {
+      cwd: repoDir,
+      env: {
+        ...envFor(binDir, dataDir),
+        FAKE_ENGINE_DELAY_MS: "1500"
+      }
+    });
+    if (status.status !== 0) {
+      return false;
+    }
+    const parsed = JSON.parse(status.stdout);
+    return parsed.job.steps?.[0]?.status === "running";
+  });
+
+  const cancel = run(process.execPath, [SCRIPT, "cancel", jobId], {
+    cwd: repoDir,
+    env: envFor(binDir, dataDir)
+  });
+  assert.equal(cancel.status, 0, cancel.stderr);
+  assert.match(cancel.stdout, /Cancelled/);
+
+  await waitFor(() => {
+    const status = run(process.execPath, [SCRIPT, "status", jobId, "--json"], {
+      cwd: repoDir,
+      env: envFor(binDir, dataDir)
+    });
+    if (status.status !== 0) {
+      return false;
+    }
+    const parsed = JSON.parse(status.stdout);
+    return parsed.job.status === "cancelled" && parsed.job.steps?.[0]?.status === "cancelled";
   });
 });

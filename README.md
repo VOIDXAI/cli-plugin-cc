@@ -8,6 +8,7 @@ This plugin is for Claude Code users who want one command surface for multi-engi
 
 - `/cc:review` for a normal read-only review
 - `/cc:adversarial-review` for a steerable challenge review
+- `/cc:orchestrate` to plan a multi-engine workflow, let the user adjust it, then execute after confirmation
 - `/cc:rescue`, `/cc:status`, `/cc:result`, and `/cc:cancel` to delegate work and manage background jobs
 - `/cc:setup` to check engine readiness, save defaults for this repo, and manage the optional review gate
 - one place to track jobs, view results, cancel runs, and continue earlier work
@@ -116,6 +117,41 @@ Examples:
 ```
 
 This command is read-only. It does not fix code.
+
+### `/cc:orchestrate`
+
+Builds a linear multi-step workflow across Codex, Gemini, and Droid, shows the draft plan, lets the user adjust it, and only executes after explicit confirmation.
+
+Use it when you want:
+
+- one engine to implement, another to challenge, and another to do a final review
+- a user-adjustable plan before any CLI starts running
+- a backgroundable workflow that still shows up in `/cc:status`, `/cc:result`, and `/cc:cancel`
+
+Default role mapping:
+
+- Codex for implementation or rescue work
+- Gemini for adversarial review
+- Droid for final review
+
+The user can override any step in natural language, for example:
+
+```text
+/cc:orchestrate let Codex implement the fix, Gemini challenge it, and Droid do the final review
+```
+
+The runtime supports up to 5 linear steps and uses these step kinds:
+
+- `task`
+- `review`
+- `adversarial-review`
+
+Examples:
+
+```bash
+/cc:orchestrate redesign the flaky test fix flow and make sure another engine challenges the approach
+/cc:orchestrate --background let Codex implement the bug fix, Gemini question the tradeoffs, and Droid do the final review
+```
 
 ### `/cc:rescue`
 

@@ -12,6 +12,14 @@ export function sortJobsNewestFirst(jobs) {
   return [...jobs].sort((left, right) => String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? "")));
 }
 
+function readStoredJobIfAvailable(workspaceRoot, jobId) {
+  const jobFile = resolveJobFile(workspaceRoot, jobId);
+  if (!fs.existsSync(jobFile)) {
+    return null;
+  }
+  return readJobFile(jobFile);
+}
+
 function getCurrentSessionId(options = {}) {
   return options.env?.[SESSION_ID_ENV] ?? process.env[SESSION_ID_ENV] ?? null;
 }
@@ -39,6 +47,9 @@ function getJobTypeLabel(job) {
   }
   if (job.jobClass === "gate") {
     return "stop-gate";
+  }
+  if (job.jobClass === "orchestrate") {
+    return "orchestrate";
   }
   return "job";
 }
@@ -154,6 +165,9 @@ function inferLegacyJobPhase(job, progressPreview = []) {
   }
   if (job.jobClass === "gate") {
     return "gating";
+  }
+  if (job.jobClass === "orchestrate") {
+    return "running";
   }
   return "running";
 }
@@ -276,7 +290,9 @@ export function buildSingleJobSnapshot(cwd, reference, options = {}) {
 
   return {
     workspaceRoot,
-    job: enrichJob(selected, { maxProgressLines: options.maxProgressLines })
+    job: enrichJob(readStoredJobIfAvailable(workspaceRoot, selected.id) ?? selected, {
+      maxProgressLines: options.maxProgressLines
+    })
   };
 }
 

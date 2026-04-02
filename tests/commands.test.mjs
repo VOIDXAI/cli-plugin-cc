@@ -51,11 +51,20 @@ test("adversarial review command uses AskUserQuestion and background Bash while 
 });
 
 test("commands keep the unified /cc surface", () => {
+  const orchestrate = read("commands/orchestrate.md");
   const rescue = read("commands/rescue.md");
   const setup = read("commands/setup.md");
   const status = read("commands/status.md");
   const pluginManifest = read(".claude-plugin/plugin.json");
 
+  assert.match(orchestrate, /setup --all --json/);
+  assert.match(orchestrate, /git status --short --untracked-files=all/);
+  assert.match(orchestrate, /Do not execute anything until the user chooses `Execute plan`/);
+  assert.match(orchestrate, /Execute plan/);
+  assert.match(orchestrate, /Adjust plan/);
+  assert.match(orchestrate, /Cancel/);
+  assert.match(orchestrate, /assignmentSource:\s*"manual"/);
+  assert.match(orchestrate, /orchestrate --plan-file/);
   assert.match(rescue, /--engine <codex\|gemini\|droid>/);
   assert.match(rescue, /--model <id>/);
   assert.match(rescue, /--permission <read-only\|edit\|dev\|full\|unsafe>/);

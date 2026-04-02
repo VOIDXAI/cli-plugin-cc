@@ -121,6 +121,59 @@ function escapeMarkdownCell(value) {
     .trim();
 }
 
+function getWorkflowStepSessionId(step) {
+  return step?.threadId ?? step?.sessionRef ?? step?.ownerState?.threadId ?? step?.ownerState?.sessionRef ?? null;
+}
+
+function appendWorkflowStepsTable(lines, steps) {
+  if (!Array.isArray(steps) || steps.length === 0) {
+    return;
+  }
+
+  lines.push("", "Steps:");
+  lines.push("| Step | Kind | Engine | Source | Status | Phase | Session ID | Summary |");
+  lines.push("| --- | --- | --- | --- | --- | --- | --- | --- |");
+  for (const step of steps) {
+    lines.push(
+      `| ${escapeMarkdownCell(step.index ? `${step.index}. ${step.title ?? step.id ?? ""}` : step.title ?? step.id ?? "")} | ${escapeMarkdownCell(step.kind ?? "")} | ${escapeMarkdownCell(step.engine ?? "")} | ${escapeMarkdownCell(step.assignmentSource ?? "")} | ${escapeMarkdownCell(step.status ?? "")} | ${escapeMarkdownCell(step.phase ?? "")} | ${escapeMarkdownCell(getWorkflowStepSessionId(step) ?? "")} | ${escapeMarkdownCell(step.summary ?? "")} |`
+    );
+  }
+}
+
+function renderOrchestrationStoredJobResult(job, storedJob) {
+  const workflow = storedJob?.workflow ?? job?.workflow ?? null;
+  const steps = Array.isArray(storedJob?.steps) ? storedJob.steps : Array.isArray(job?.steps) ? job.steps : [];
+  const lines = ["# Orchestration Result", ""];
+  if (workflow?.title || job?.title) {
+    lines.push(`Workflow: ${workflow?.title ?? job.title}`);
+  }
+  if (workflow?.task) {
+    lines.push(`Task: ${workflow.task}`);
+  }
+  lines.push(`Status: ${storedJob?.status ?? job?.status ?? "unknown"}`);
+  if (storedJob?.summary || job?.summary) {
+    lines.push(`Summary: ${storedJob?.summary ?? job?.summary}`);
+  }
+
+  appendWorkflowStepsTable(lines, steps);
+
+  for (const step of steps) {
+    lines.push("", `## Step ${step.index ?? "?"}: ${step.title ?? step.id ?? "workflow-step"}`, "");
+    lines.push(`- Kind: ${step.kind}`);
+    lines.push(`- Engine: ${step.engine}`);
+    lines.push(`- Source: ${step.assignmentSource}`);
+    lines.push(`- Status: ${step.status}`);
+    if (step.summary) {
+      lines.push(`- Summary: ${step.summary}`);
+    }
+    if (step.rendered) {
+      lines.push("", step.rendered.trimEnd());
+    }
+  }
+
+  return `${lines.join("\n").trimEnd()}\n`;
+}
+
 function formatResumeCommand(job) {
   if (!job?.engine) {
     return null;
@@ -176,6 +229,9 @@ function pushJobDetails(lines, job, options = {}) {
   }
   if (getEffectiveSessionId(job)) {
     lines.push(`  Session ID: ${getEffectiveSessionId(job)}`);
+  }
+  if (job.jobClass === "orchestrate" && Number.isInteger(job.currentStepIndex) && (job.totalSteps ?? 0) > 0) {
+    lines.push(`  Current step: ${job.currentStepIndex + 1}/${job.totalSteps}`);
   }
   const permissionSummary = formatJobPermission(job);
   if (permissionSummary) {
@@ -462,10 +518,16 @@ export function renderJobStatusReport(job) {
     showResultHint: true,
     showReviewHint: true
   });
+  if (job.jobClass === "orchestrate") {
+    appendWorkflowStepsTable(lines, job.steps ?? []);
+  }
   return `${lines.join("\n").trimEnd()}\n`;
 }
 
 export function renderStoredJobResult(job, storedJob) {
+  if (job?.jobClass === "orchestrate" || storedJob?.jobClass === "orchestrate") {
+    return renderOrchestrationStoredJobResult(job, storedJob);
+  }
   const threadId = storedJob?.threadId ?? job.threadId ?? job.ownerState?.threadId ?? null;
   const sessionRef = storedJob?.sessionRef ?? job.sessionRef ?? job.ownerState?.sessionRef ?? null;
   const resumeCommand = formatResumeCommand({

@@ -4,6 +4,15 @@ function generateRunId(engine) {
 }
 
 const ENGINE_CAPABILITY_MATRIX = {
+  multi: {
+    supportsStructuredReview: false,
+    resumeKind: "none",
+    interruptKind: "process",
+    streamingLevel: "basic",
+    modelControl: "none",
+    effortControl: "unsupported",
+    permissionControl: "none"
+  },
   codex: {
     supportsStructuredReview: true,
     resumeKind: "thread",

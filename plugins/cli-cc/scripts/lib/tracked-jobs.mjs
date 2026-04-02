@@ -177,31 +177,32 @@ export async function runTrackedJob(job, runner, options = {}) {
     const execution = await runner();
     const completionStatus = execution.exitStatus === 0 ? "completed" : execution.exitStatus === 130 ? "cancelled" : "failed";
     const completedAt = nowIso();
+    const existing = readStoredJobOrNull(job.workspaceRoot, job.id) ?? runningRecord;
     writeJobFile(job.workspaceRoot, job.id, {
-      ...runningRecord,
+      ...existing,
       status: completionStatus,
-      threadId: execution.threadId ?? runningRecord.threadId ?? null,
-      turnId: execution.turnId ?? runningRecord.turnId ?? null,
-      sessionRef: execution.sessionRef ?? runningRecord.sessionRef ?? null,
+      threadId: execution.threadId ?? existing.threadId ?? null,
+      turnId: execution.turnId ?? existing.turnId ?? null,
+      sessionRef: execution.sessionRef ?? existing.sessionRef ?? null,
       pid: null,
       phase: completionStatus === "completed" ? "done" : completionStatus,
       completedAt,
-      capabilities: execution.capabilities ?? runningRecord.capabilities ?? null,
+      capabilities: execution.capabilities ?? existing.capabilities ?? null,
       ownerState:
         execution.ownerState ??
-        (runningRecord.ownerState
+        (existing.ownerState
           ? {
-              ...runningRecord.ownerState,
+              ...existing.ownerState,
               state: completionStatus,
-              sessionRef: execution.sessionRef ?? runningRecord.sessionRef ?? null,
-              threadId: execution.threadId ?? runningRecord.threadId ?? null,
-              turnId: execution.turnId ?? runningRecord.turnId ?? null
+              sessionRef: execution.sessionRef ?? existing.sessionRef ?? null,
+              threadId: execution.threadId ?? existing.threadId ?? null,
+              turnId: execution.turnId ?? existing.turnId ?? null
             }
           : null),
       result: execution.payload,
       rendered: execution.rendered,
-      summary: execution.summary ?? runningRecord.summary ?? null,
-      note: execution.note ?? runningRecord.note ?? null
+      summary: execution.summary ?? existing.summary ?? null,
+      note: execution.note ?? existing.note ?? null
     });
     upsertJob(job.workspaceRoot, {
       id: job.id,

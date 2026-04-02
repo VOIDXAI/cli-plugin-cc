@@ -21,6 +21,11 @@ import {
   startEngineRun
 } from "./lib/engines.mjs";
 import {
+  readWorkflowPlanFile,
+  normalizeWorkflowPlan,
+  interpolateWorkflowTemplate
+} from "./lib/orchestration.mjs";
+import {
   buildSingleJobSnapshot,
   buildStatusSnapshot,
   listResumeCandidates,
@@ -48,6 +53,8 @@ import {
   renderTaskResult
 } from "./lib/render.mjs";
 import {
+  appendLogBlock,
+  appendLogLine,
   createJobLogFile,
   createJobProgressUpdater,
   createJobRecord,
@@ -65,6 +72,7 @@ import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 const SCRIPT_PATH = fileURLToPath(import.meta.url);
 const DEFAULT_STATUS_WAIT_TIMEOUT_MS = 240000;
 const DEFAULT_STATUS_POLL_INTERVAL_MS = 2000;
+const WORKFLOW_STEP_OUTPUT_MAX_CHARS = 12000;
 const VALID_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
 function normalizeRequestedModel(engine, model) {
   if (model == null) {
@@ -305,6 +313,465 @@ function createTaskJob({ workspaceRoot, cwd, engine, options, prompt, readOnly =
       permissionSummary
     }
   });
+}
+
+function cloneJson(value) {
+  return typeof structuredClone === "function" ? structuredClone(value) : JSON.parse(JSON.stringify(value));
+}
+
+function createWorkflowStepRecord(step, index) {
+  return {
+    index: index + 1,
+    id: step.id,
+    title: step.title,
+    engine: step.engine,
+    assignmentSource: step.assignmentSource,
+    kind: step.kind,
+    input: step.input ?? null,
+    options: step.options ?? {},
+    resolvedInput: null,
+    status: "pending",
+    phase: "pending",
+    summary: null,
+    sessionRef: null,
+    threadId: null,
+    turnId: null,
+    startedAt: null,
+    completedAt: null,
+    model: null,
+    effort: null,
+    permission: null,
+    permissionNative: null,
+    permissionSource: null,
+    ownerState: createEngineOwnerState(step.engine, "queued"),
+    rendered: null,
+    output: null,
+    result: null
+  };
+}
+
+function createOrchestrateJob({ workspaceRoot, cwd, plan }) {
+  return createBaseJob({
+    workspaceRoot,
+    cwd,
+    engine: "multi",
+    jobClass: "orchestrate",
+    kindLabel: "orchestrate",
+    title: plan.title,
+    extra: {
+      workflow: plan,
+      totalSteps: plan.steps.length,
+      currentStepIndex: null,
+      currentStepId: null,
+      steps: plan.steps.map((step, index) => createWorkflowStepRecord(step, index)),
+      summary: `Queued ${plan.steps.length}-step workflow.`,
+      lastCompletedStepIndex: null
+    }
+  });
+}
+
+function workflowStepLabel(step, index, totalSteps) {
+  return `Step ${index + 1}/${totalSteps}: ${step.title}`;
+}
+
+function workflowRunningPhase(index, totalSteps, phase = "running") {
+  return `step ${index + 1}/${totalSteps} ${phase}`;
+}
+
+function updateWorkflowJobState(workspaceRoot, jobId, mutate) {
+  const existing = readStoredJob(workspaceRoot, jobId) ?? readJob(workspaceRoot, jobId);
+  if (!existing) {
+    throw new Error(`Workflow job ${jobId} could not be loaded from state.`);
+  }
+
+  const next = cloneJson(existing);
+  mutate(next);
+  next.updatedAt = nowIso();
+  writeJobFile(workspaceRoot, jobId, next);
+  upsertJob(workspaceRoot, next);
+  return next;
+}
+
+function buildWorkflowInterpolationContext(workflowJob) {
+  const steps = {};
+  for (const step of workflowJob.steps ?? []) {
+    steps[step.id] = {
+      summary: step.summary ?? "",
+      output: step.output ?? ""
+    };
+  }
+  return {
+    workflowTask: workflowJob.workflow?.task ?? "",
+    steps
+  };
+}
+
+async function assertWorkflowEnginesReady(plan, cwd) {
+  const engines = [...new Set(plan.steps.map((step) => step.engine))];
+  for (const engine of engines) {
+    const detected = await detectEngine(engine, cwd);
+    if (!detected.available) {
+      throw new Error(`${detected.label} is not installed or not on PATH. Run /cc:setup --engine ${engine} first.`);
+    }
+    if (!detected.auth?.loggedIn) {
+      throw new Error(
+        `${detected.label} is available but not authenticated. ${detected.auth?.detail ?? `Run /cc:setup --engine ${engine} for guidance.`}`
+      );
+    }
+  }
+}
+
+function buildWorkflowStepExecutionJob({ workflowJob, step, resolvedInput, resolvedOptions }) {
+  if (step.kind === "task") {
+    const semanticPermission = normalizeTaskPermission(resolvedOptions.permission);
+    return {
+      id: `${workflowJob.id}:${step.id}`,
+      workspaceRoot: workflowJob.workspaceRoot,
+      cwd: workflowJob.workspaceRoot,
+      engine: step.engine,
+      jobClass: "task",
+      kindLabel: "rescue",
+      title: step.title,
+      prompt: resolvedInput,
+      readOnly: false,
+      write: semanticPermission !== "read-only",
+      resume: false,
+      model: normalizeRequestedModel(step.engine, resolvedOptions.model),
+      effort: normalizeReasoningEffort(resolvedOptions.effort),
+      requestedPermission: normalizeTaskPermission(resolvedOptions.requestedPermission),
+      permission: semanticPermission,
+      permissionSource: resolvedOptions.permissionSource ?? "legacy",
+      permissionNative: resolvedOptions.permissionNative ?? null,
+      permissionSummary: formatTaskPermissionSummary({
+        permission: semanticPermission,
+        nativeLabel: resolvedOptions.permissionNative
+      }),
+      capabilities: getEngineRuntimeCapabilities(step.engine),
+      ownerState: createEngineOwnerState(step.engine, "queued")
+    };
+  }
+
+  return {
+    id: `${workflowJob.id}:${step.id}`,
+    workspaceRoot: workflowJob.workspaceRoot,
+    cwd: workflowJob.workspaceRoot,
+    engine: step.engine,
+    jobClass: step.kind,
+    kindLabel: step.kind,
+    title: step.title,
+    scope: resolvedOptions.scope || "auto",
+    baseRef: resolvedOptions.base ?? null,
+    focusText: step.kind === "adversarial-review" ? resolvedInput ?? null : null,
+    model: normalizeRequestedModel(step.engine, resolvedOptions.model),
+    effort: normalizeReasoningEffort(resolvedOptions.effort),
+    capabilities: getEngineRuntimeCapabilities(step.engine),
+    ownerState: createEngineOwnerState(step.engine, "queued")
+  };
+}
+
+function buildWorkflowStepRequest(stepJob) {
+  if (stepJob.jobClass === "review" || stepJob.jobClass === "adversarial-review") {
+    return {
+      engine: stepJob.engine,
+      kind: stepJob.jobClass,
+      cwd: stepJob.workspaceRoot,
+      scope: stepJob.scope,
+      baseRef: stepJob.baseRef,
+      focusText: stepJob.focusText,
+      model: stepJob.model,
+      effort: stepJob.effort
+    };
+  }
+
+  return {
+    engine: stepJob.engine,
+    kind: "task",
+    cwd: stepJob.workspaceRoot,
+    prompt: stepJob.prompt,
+    resume: false,
+    resumeSessionRef: null,
+    model: stepJob.model,
+    effort: stepJob.effort,
+    readOnly: false,
+    permission: stepJob.permission
+  };
+}
+
+function renderWorkflowStepResult(result, stepJob) {
+  return stepJob.jobClass === "review" || stepJob.jobClass === "adversarial-review"
+    ? renderReview(result, stepJob)
+    : renderTaskResult(result, stepJob);
+}
+
+function summarizeWorkflowCompletion(workflowJob, options = {}) {
+  const completed = (workflowJob.steps ?? []).filter((step) => step.status === "completed").length;
+  const total = workflowJob.steps?.length ?? 0;
+  if (options.status === "failed" && options.step) {
+    return `Failed at step ${options.index + 1}/${total}: ${options.step.title}`;
+  }
+  if (options.status === "cancelled" && options.step) {
+    return `Cancelled at step ${options.index + 1}/${total}: ${options.step.title}`;
+  }
+  if (total === 0) {
+    return "Workflow complete.";
+  }
+  return `Completed ${completed}/${total} steps.`;
+}
+
+function renderOrchestrationResult(jobLike) {
+  const lines = ["# Orchestration Result", "", `Workflow: ${jobLike.title}`, `Task: ${jobLike.workflow?.task ?? ""}`, ""];
+  lines.push("| Step | Kind | Engine | Source | Status | Summary |");
+  lines.push("| --- | --- | --- | --- | --- | --- |");
+  for (const step of jobLike.steps ?? []) {
+    lines.push(
+      `| ${escapeMarkdown(step.index ? `${step.index}. ${step.title ?? ""}` : step.title ?? "")} | ${escapeMarkdown(step.kind ?? "")} | ${escapeMarkdown(step.engine ?? "")} | ${escapeMarkdown(step.assignmentSource ?? "")} | ${escapeMarkdown(step.status ?? "")} | ${escapeMarkdown(step.summary ?? "")} |`
+    );
+  }
+
+  for (const step of jobLike.steps ?? []) {
+    lines.push("", `## Step ${step.index}: ${step.title}`, "");
+    lines.push(`- Kind: ${step.kind}`);
+    lines.push(`- Engine: ${step.engine}`);
+    lines.push(`- Source: ${step.assignmentSource}`);
+    lines.push(`- Status: ${step.status}`);
+    if (step.summary) {
+      lines.push(`- Summary: ${step.summary}`);
+    }
+    if (step.rendered) {
+      lines.push("", step.rendered.trimEnd());
+    }
+  }
+
+  return `${lines.join("\n").trimEnd()}\n`;
+}
+
+function escapeMarkdown(value) {
+  return String(value ?? "")
+    .replace(/\|/g, "\\|")
+    .replace(/\r?\n/g, " ")
+    .trim();
+}
+
+async function executeWorkflowStep(workflowJob, step, index, totalSteps) {
+  const config = getConfig(workflowJob.workspaceRoot);
+  const defaults = getEngineDefaults(config, step.engine);
+  const context = buildWorkflowInterpolationContext(workflowJob);
+  const resolvedInput =
+    step.input == null
+      ? null
+      : interpolateWorkflowTemplate(step.input, context, {
+          maxStepOutputChars: WORKFLOW_STEP_OUTPUT_MAX_CHARS
+        });
+  const resolvedOptions =
+    step.kind === "task"
+      ? applyTaskDefaults(step.engine, step.options ?? {}, defaults, emitWarning)
+      : applyEngineDefaults(step.engine, step.options ?? {}, defaults, emitWarning);
+  const stepJob = buildWorkflowStepExecutionJob({
+    workflowJob,
+    step,
+    resolvedInput,
+    resolvedOptions
+  });
+  const request = buildWorkflowStepRequest(stepJob);
+
+  let latestWorkflowJob = updateWorkflowJobState(workflowJob.workspaceRoot, workflowJob.id, (stored) => {
+    const storedStep = stored.steps[index];
+    stored.currentStepIndex = index;
+    stored.currentStepId = storedStep.id;
+    stored.summary = workflowStepLabel(storedStep, index, totalSteps);
+    stored.phase = workflowRunningPhase(index, totalSteps, "starting");
+    storedStep.status = "running";
+    storedStep.phase = "starting";
+    storedStep.startedAt = storedStep.startedAt ?? nowIso();
+    storedStep.resolvedInput = resolvedInput;
+    storedStep.model = stepJob.model ?? null;
+    storedStep.effort = stepJob.effort ?? null;
+    storedStep.permission = stepJob.permission ?? null;
+    storedStep.permissionNative = stepJob.permissionNative ?? null;
+    storedStep.permissionSource = stepJob.permissionSource ?? null;
+    stored.threadId = null;
+    stored.turnId = null;
+    stored.sessionRef = null;
+  });
+  appendLogLine(
+    workflowJob.logFile,
+    `${workflowStepLabel(step, index, totalSteps)} started (${step.kind} via ${step.engine}, source=${step.assignmentSource}).`
+  );
+
+  const handle = startEngineRun(request);
+  const pumpEvents = (async () => {
+    for await (const event of handle.events()) {
+      const progress = engineEventToProgress(event, step.engine);
+      if (progress.message) {
+        appendLogLine(workflowJob.logFile, `${workflowStepLabel(step, index, totalSteps)} ${progress.message}`);
+      }
+      if (progress.logTitle && progress.logBody) {
+        appendLogBlock(workflowJob.logFile, `${workflowStepLabel(step, index, totalSteps)} ${progress.logTitle}`, progress.logBody);
+      }
+
+      latestWorkflowJob = updateWorkflowJobState(workflowJob.workspaceRoot, workflowJob.id, (stored) => {
+        const storedStep = stored.steps[index];
+        stored.currentStepIndex = index;
+        stored.currentStepId = storedStep.id;
+        stored.summary = workflowStepLabel(storedStep, index, totalSteps);
+        stored.phase = workflowRunningPhase(index, totalSteps, progress.phase ?? storedStep.phase ?? "running");
+        storedStep.status = "running";
+        storedStep.phase = progress.phase ?? storedStep.phase ?? "running";
+        if (progress.message) {
+          storedStep.summary = progress.message;
+        }
+        if (progress.sessionRef) {
+          stored.sessionRef = progress.sessionRef;
+          storedStep.sessionRef = progress.sessionRef;
+        }
+        if (progress.threadId) {
+          stored.threadId = progress.threadId;
+          storedStep.threadId = progress.threadId;
+        }
+        if (progress.turnId) {
+          stored.turnId = progress.turnId;
+          storedStep.turnId = progress.turnId;
+        }
+        if (progress.ownerState) {
+          storedStep.ownerState = progress.ownerState;
+        }
+      });
+    }
+  })();
+
+  let result;
+  try {
+    result = await handle.result();
+  } finally {
+    await pumpEvents;
+  }
+
+  const rendered = renderWorkflowStepResult(result, stepJob);
+  const completionStatus = result.ok ? "completed" : "failed";
+  const completedAt = nowIso();
+  const completionSummary =
+    result.structured?.summary ??
+    firstMeaningfulLine(result.finalText, `${step.title} ${result.ok ? "completed" : "failed"}.`);
+
+  latestWorkflowJob = updateWorkflowJobState(workflowJob.workspaceRoot, workflowJob.id, (stored) => {
+    const storedStep = stored.steps[index];
+    stored.currentStepIndex = index;
+    stored.currentStepId = storedStep.id;
+    storedStep.status = completionStatus;
+    storedStep.phase = result.ok ? "done" : "failed";
+    storedStep.summary = completionSummary;
+    storedStep.completedAt = completedAt;
+    storedStep.sessionRef = result.sessionRef ?? storedStep.sessionRef ?? null;
+    storedStep.threadId = result.threadId ?? storedStep.threadId ?? null;
+    storedStep.turnId = result.turnId ?? storedStep.turnId ?? null;
+    storedStep.ownerState = createEngineOwnerState(step.engine, result.ok ? "completed" : "failed", {
+      sessionRef: result.sessionRef ?? result.threadId ?? null,
+      threadId: result.threadId ?? null,
+      turnId: result.turnId ?? null
+    });
+    storedStep.rendered = rendered;
+    storedStep.output = rendered.trim();
+    storedStep.result = result;
+    stored.summary = result.ok
+      ? index === totalSteps - 1
+        ? summarizeWorkflowCompletion(stored, { status: "completed" })
+        : `Completed step ${index + 1}/${totalSteps}: ${storedStep.title}`
+      : summarizeWorkflowCompletion(stored, {
+          status: "failed",
+          step: storedStep,
+          index
+        });
+    stored.phase = result.ok
+      ? index === totalSteps - 1
+        ? "done"
+        : workflowRunningPhase(index + 1 < totalSteps ? index + 1 : index, totalSteps, "waiting")
+      : workflowRunningPhase(index, totalSteps, "failed");
+    stored.lastCompletedStepIndex = index;
+    stored.threadId = result.threadId ?? stored.threadId ?? null;
+    stored.turnId = result.turnId ?? stored.turnId ?? null;
+    stored.sessionRef = result.sessionRef ?? stored.sessionRef ?? null;
+  });
+
+  appendLogBlock(workflowJob.logFile, `${workflowStepLabel(step, index, totalSteps)} output`, rendered);
+
+  return {
+    workflowJob: latestWorkflowJob,
+    stepJob,
+    result,
+    rendered,
+    summary: completionSummary
+  };
+}
+
+async function executeOrchestrateJob(job) {
+  return runTrackedJob(
+    job,
+    async () => {
+      let workflowJob = readStoredJob(job.workspaceRoot, job.id) ?? job;
+      const totalSteps = workflowJob.steps?.length ?? 0;
+      let finalStepResult = null;
+
+      for (let index = 0; index < totalSteps; index += 1) {
+        const step = workflowJob.steps[index];
+        const execution = await executeWorkflowStep(workflowJob, step, index, totalSteps);
+        workflowJob = execution.workflowJob;
+        finalStepResult = execution.result;
+        if (!execution.result.ok) {
+          return {
+            exitStatus: 1,
+            payload: {
+              workflow: workflowJob.workflow,
+              steps: workflowJob.steps
+            },
+            rendered: renderOrchestrationResult(workflowJob),
+            summary: summarizeWorkflowCompletion(workflowJob, {
+              status: "failed",
+              step,
+              index
+            }),
+            threadId: execution.result.threadId ?? null,
+            turnId: execution.result.turnId ?? null,
+            sessionRef: execution.result.sessionRef ?? execution.result.threadId ?? null,
+            capabilities: getEngineRuntimeCapabilities(step.engine),
+            ownerState: createEngineOwnerState("multi", "failed", {
+              sessionRef: execution.result.sessionRef ?? execution.result.threadId ?? null,
+              threadId: execution.result.threadId ?? null,
+              turnId: execution.result.turnId ?? null
+            })
+          };
+        }
+      }
+
+      const completedWorkflow = updateWorkflowJobState(job.workspaceRoot, job.id, (stored) => {
+        stored.currentStepIndex = totalSteps > 0 ? totalSteps - 1 : null;
+        stored.currentStepId = totalSteps > 0 ? stored.steps[totalSteps - 1]?.id ?? null : null;
+        stored.summary = summarizeWorkflowCompletion(stored, { status: "completed" });
+        stored.phase = "done";
+      });
+
+      return {
+        exitStatus: 0,
+        payload: {
+          workflow: completedWorkflow.workflow,
+          steps: completedWorkflow.steps
+        },
+        rendered: renderOrchestrationResult(completedWorkflow),
+        summary: summarizeWorkflowCompletion(completedWorkflow, { status: "completed" }),
+        threadId: finalStepResult?.threadId ?? null,
+        turnId: finalStepResult?.turnId ?? null,
+        sessionRef: finalStepResult?.sessionRef ?? finalStepResult?.threadId ?? null,
+        capabilities: getEngineRuntimeCapabilities("multi"),
+        ownerState: createEngineOwnerState("multi", "completed", {
+          sessionRef: finalStepResult?.sessionRef ?? finalStepResult?.threadId ?? null,
+          threadId: finalStepResult?.threadId ?? null,
+          turnId: finalStepResult?.turnId ?? null
+        })
+      };
+    },
+    {
+      logFile: job.logFile
+    }
+  );
 }
 
 async function maybePopulateResumeSession(job) {
@@ -617,6 +1084,37 @@ async function handleTask(argv, { jobClass = "task", readOnly = false } = {}) {
   outputResult(options.json ? execution.payload : execution.rendered, Boolean(options.json));
 }
 
+async function handleOrchestrate(argv) {
+  const { options } = parseCommandInput(argv, {
+    valueOptions: ["cwd", "plan-file"],
+    booleanOptions: ["json", "background", "wait"]
+  });
+
+  const cwd = resolveCommandCwd(options);
+  const workspaceRoot = resolveWorkspaceRoot(cwd);
+  const plan = normalizeWorkflowPlan(readWorkflowPlanFile(options["plan-file"]), {
+    supportedEngines: listSupportedEngines().map((engine) => engine.id)
+  });
+  await assertWorkflowEnginesReady(plan, cwd);
+
+  const job = createOrchestrateJob({
+    workspaceRoot,
+    cwd,
+    plan
+  });
+
+  if (resolveBackground(options)) {
+    const pid = spawnBackgroundWorker(job);
+    const queuedJob = storeQueuedJob(job, pid);
+    outputResult(options.json ? queuedJob : `Started ${job.id} in background (pid ${pid}).\n`, Boolean(options.json));
+    return;
+  }
+
+  const execution = await executeOrchestrateJob(job);
+  process.exitCode = execution.exitStatus;
+  outputResult(options.json ? execution.payload : execution.rendered, Boolean(options.json));
+}
+
 async function handleStatus(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["cwd", "timeout-ms", "poll-ms", "poll-interval-ms"],
@@ -688,19 +1186,34 @@ async function handleCancel(argv) {
 
   const cwd = resolveCommandCwd(options);
   const { workspaceRoot, job } = resolveCancelableJob(cwd, positionals[0] ?? null);
+  const activeJob = readStoredJob(workspaceRoot, job.id) ?? job;
   let interruptDetail = null;
 
-  if (job.status === "running") {
+  if (activeJob.status === "running") {
     try {
-      interruptDetail = await interruptEngineJob(workspaceRoot, job);
+      if (activeJob.jobClass === "orchestrate") {
+        const activeStep =
+          Number.isInteger(activeJob.currentStepIndex) && activeJob.currentStepIndex >= 0
+            ? activeJob.steps?.[activeJob.currentStepIndex] ?? null
+            : null;
+        if (activeStep?.engine === "codex") {
+          interruptDetail = await interruptEngineJob(workspaceRoot, {
+            engine: activeStep.engine,
+            threadId: activeStep.threadId ?? null,
+            turnId: activeStep.turnId ?? null
+          });
+        }
+      } else {
+        interruptDetail = await interruptEngineJob(workspaceRoot, activeJob);
+      }
     } catch {
       interruptDetail = null;
     }
   }
 
-  if (job.pid) {
+  if (activeJob.pid) {
     try {
-      terminateProcessTree(job.pid);
+      terminateProcessTree(activeJob.pid);
     } catch {
       // Ignore stale pids.
     }
@@ -708,13 +1221,27 @@ async function handleCancel(argv) {
 
   const completedAt = nowIso();
   const cancelledJob = {
-    ...job,
+    ...activeJob,
     status: "cancelled",
     phase: "cancelled",
     pid: null,
     completedAt,
     note: "Cancelled by user."
   };
+  if (cancelledJob.jobClass === "orchestrate" && Number.isInteger(cancelledJob.currentStepIndex) && cancelledJob.currentStepIndex >= 0) {
+    const activeStep = cancelledJob.steps?.[cancelledJob.currentStepIndex] ?? null;
+    if (activeStep) {
+      activeStep.status = "cancelled";
+      activeStep.phase = "cancelled";
+      activeStep.completedAt = completedAt;
+      activeStep.summary = activeStep.summary ?? "Cancelled by user.";
+    }
+    cancelledJob.summary = summarizeWorkflowCompletion(cancelledJob, {
+      status: "cancelled",
+      step: activeStep,
+      index: cancelledJob.currentStepIndex
+    });
+  }
   upsertJob(workspaceRoot, cancelledJob);
   const storedPath = resolveJobFile(workspaceRoot, job.id);
   if (fs.existsSync(storedPath)) {
@@ -734,15 +1261,21 @@ async function runBackgroundWorker(jobId, argv) {
   });
   const cwd = process.env.CLI_PLUGIN_CC_CWD || resolveCommandCwd(options);
   const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const job = readJob(workspaceRoot, jobId);
+  const job = readStoredJob(workspaceRoot, jobId) ?? readJob(workspaceRoot, jobId);
   if (!job) {
     process.exit(1);
   }
 
-  const execution = await executeJob({
-    ...job,
-    workspaceRoot
-  });
+  const execution =
+    job.jobClass === "orchestrate"
+      ? await executeOrchestrateJob({
+          ...job,
+          workspaceRoot
+        })
+      : await executeJob({
+          ...job,
+          workspaceRoot
+        });
   if (execution.exitStatus !== 0) {
     process.exit(execution.exitStatus);
   }
@@ -769,6 +1302,9 @@ async function main() {
       return;
     case "task":
       await handleTask(argv);
+      return;
+    case "orchestrate":
+      await handleOrchestrate(argv);
       return;
     case "gate":
       await handleTask(argv, { jobClass: "gate", readOnly: true });

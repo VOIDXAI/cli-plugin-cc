@@ -432,6 +432,12 @@ export function normalizeReviewPayload(payload) {
       ? payload.verdict
       : typeof payload.decision === "string"
         ? payload.decision
+        : typeof payload.outcome === "string"
+          ? payload.outcome
+          : typeof payload.finding_type === "string"
+            ? payload.finding_type
+            : typeof payload.overall_assessment === "string"
+              ? payload.overall_assessment
         : null;
   if (!verdict || !sourceFindings) {
     return null;
@@ -450,7 +456,14 @@ export function normalizeReviewPayload(payload) {
                 ? "medium"
                 : "low"
             : "medium",
-      title: typeof source.title === "string" ? source.title : `Finding ${index + 1}`,
+      title:
+        typeof source.title === "string"
+          ? source.title
+          : typeof source.headline === "string"
+            ? source.headline
+            : typeof source.affected_file === "string"
+              ? `Issue in ${source.affected_file}`
+              : `Finding ${index + 1}`,
       body:
         typeof source.body === "string"
           ? source.body
@@ -462,7 +475,9 @@ export function normalizeReviewPayload(payload) {
                 ? source.message
                 : typeof source.review_comment === "string"
                   ? source.review_comment
-              : "No details provided.",
+                  : typeof source.recommendation === "string"
+                    ? source.recommendation
+                    : "No details provided.",
       file:
         typeof source.file === "string"
           ? source.file
@@ -470,6 +485,8 @@ export function normalizeReviewPayload(payload) {
             ? source.range.file
             : typeof source.file_path === "string"
               ? source.file_path
+              : typeof source.affected_file === "string"
+                ? source.affected_file
             : "unknown",
       line_start:
         Number.isInteger(source.line_start)
@@ -496,6 +513,7 @@ export function normalizeReviewPayload(payload) {
       recommendation: typeof source.recommendation === "string" ? source.recommendation : ""
     };
   });
+  const findingSummary = sourceFindings.find((finding) => typeof finding?.summary === "string" && finding.summary.trim())?.summary ?? null;
 
   return {
     verdict,
@@ -506,9 +524,11 @@ export function normalizeReviewPayload(payload) {
           ? payload.comment
           : typeof payload.reason === "string" && payload.reason.trim()
             ? payload.reason
-        : findings.length > 0
-          ? `${findings.length} material finding(s) reported.`
-          : "No material issues found.",
+            : findingSummary
+              ? findingSummary
+              : findings.length > 0
+                ? `${findings.length} material finding(s) reported.`
+                : "No material issues found.",
     findings,
     next_steps: Array.isArray(payload.next_steps) ? payload.next_steps : []
   };
